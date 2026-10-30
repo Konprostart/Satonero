@@ -119,6 +119,9 @@ pub fn calculate_dev_fee(total_mostro_fee: i64, percentage: f64) -> i64 {
 /// Returns the total amount in satoshis for the dev fund
 pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
     let mostro_settings = Settings::get_mostro();
+    if !mostro_settings.dev_fee_enabled {
+        return 0;
+    }
     calculate_dev_fee(total_mostro_fee, mostro_settings.dev_fee_percentage)
 }
 

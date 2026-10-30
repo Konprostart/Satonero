@@ -86,7 +86,7 @@ mod tests {
     // Fake settings for the test
     const NOSTR_SETTINGS: &str = r#"[nostr]
                                     nsec_privkey = 'nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd'
-                                    relays = ['wss://relay.damus.io','wss://relay.mostro.network']"#;
+                                    relays = ['ws://localhost:7000']"#;
 
     const LIGHTNING_SETTINGS: &str = r#"[lightning]
                                             lnd_cert_file = '/home/user/.polar/networks/1/volumes/lnd/alice/tls.cert'
@@ -231,7 +231,7 @@ mod tests {
         );
         assert_eq!(
             nostr_settings.nostr.relays,
-            vec!["wss://relay.damus.io", "wss://relay.mostro.network"]
+            vec!["ws://localhost:7000"]
         );
     }
 

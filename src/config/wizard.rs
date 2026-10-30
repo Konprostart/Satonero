@@ -196,7 +196,7 @@ fn prompt_nostr_settings(settings_dir: &Path) -> Result<NostrSettings, MostroErr
 
     let relays_input: String = Input::new()
         .with_prompt("Nostr relays (comma-separated)")
-        .default("wss://relay.mostro.network".to_string())
+        .default("ws://localhost:7000".to_string())
         .validate_with(|input: &String| validate_relays(input))
         .interact_text()
         .map_err(|e| MostroInternalErr(ServiceError::IOError(e.to_string())))?;

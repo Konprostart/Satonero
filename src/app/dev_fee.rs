@@ -113,6 +113,9 @@ const DEV_FEE_RETRY_JITTER: f64 = 0.25;
 /// other chain every cycle would resolve it over LNURL just to reject the
 /// invoice for the wrong currency (#1039). Unknown chains fail closed.
 pub fn dev_fee_payments_enabled(networks: &[String]) -> bool {
+    if !Settings::get_mostro().dev_fee_enabled {
+        return false;
+    }
     networks.first().map(String::as_str) == Some("mainnet")
 }
 

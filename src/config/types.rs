@@ -401,6 +401,10 @@ fn default_health_enabled() -> bool {
     true
 }
 
+fn default_dev_fee_enabled() -> bool {
+    true
+}
+
 /// Default seconds between health event publications.
 pub const DEFAULT_HEALTH_INTERVAL: u64 = 60;
 /// Allowed range of `[health].interval`, in seconds (protocol: 30 to 3600).
@@ -1007,6 +1011,9 @@ pub struct MostroSettings {
     /// Development fee as percentage of Mostro fee (0.10 to 1.0)
     /// Example: 0.30 means 30% of the Mostro fee goes to development
     pub dev_fee_percentage: f64,
+    /// Enable developer fee payments. Defaults to true for backward compatibility.
+    #[serde(default = "default_dev_fee_enabled")]
+    pub dev_fee_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1143,6 +1150,7 @@ impl Default for MostroSettings {
             ],
             max_orders_per_response: 10,
             dev_fee_percentage: 0.30,
+            dev_fee_enabled: true,
             name: None,
             about: None,
             picture: None,
