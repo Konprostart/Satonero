@@ -1,6 +1,6 @@
 # Satonero 🧌
 
-> Independent Bitcoin/Lightning P2P marketplace based on the Mostro protocol (MIT).
+> Independent Bitcoin/Lightning P2P marketplace based on the Mostro protocol (GPL-3.0-or-later).
 
 [![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
 [![Rust Version](https://img.shields.io/badge/rust-1.94.0%2B-blue.svg)](https://www.rust-lang.org)
