@@ -229,10 +229,7 @@ mod tests {
             nostr_settings.nostr.nsec_privkey.expose_secret(),
             "nsec13as48eum93hkg7plv526r9gjpa0uc52zysqm93pmnkca9e69x6tsdjmdxd"
         );
-        assert_eq!(
-            nostr_settings.nostr.relays,
-            vec!["ws://localhost:7000"]
-        );
+        assert_eq!(nostr_settings.nostr.relays, vec!["ws://localhost:7000"]);
     }
 
     #[test]
