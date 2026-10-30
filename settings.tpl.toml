@@ -153,6 +153,9 @@ max_orders_per_response = 10
 # Development sustainability fee
 # Percentage of Mostro fee sent to development fund (0.30 means 30% of the Mostro fee)
 dev_fee_percentage = 0.30
+# Enable developer-fee payments independently of user trading fees
+# (true keeps the current behavior; false skips all developer-fee payments)
+dev_fee_enabled = true
 # Serbero, the dispute assistant (https://github.com/MostroP2P/serbero), if you
 # run one: its public key, npub or hex. At startup Mostro registers it as a
 # read-only solver (it can talk to the parties but never settle or cancel) and
