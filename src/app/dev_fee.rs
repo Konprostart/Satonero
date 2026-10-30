@@ -79,6 +79,7 @@
 
 use crate::app::health::lnd_sync::LndSyncState;
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
+use crate::config::settings::Settings;
 use crate::db::find_unpaid_dev_fees;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::LndConnector;
