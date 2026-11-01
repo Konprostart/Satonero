@@ -428,8 +428,8 @@ Best for: Production servers, VPS deployments, full control over the daemon
 **Quick Start**:
 ```bash
 # Clone repository
-git clone https://github.com/MostroP2P/mostro.git
-cd mostro
+git clone https://github.com/Konprostart/Satonero.git
+cd Satonero
 
 # Build release binary
 cargo build --release
@@ -470,8 +470,8 @@ Best for: Local testing, development environments, quick experiments
 **Quick Start**:
 ```bash
 # Clone repository
-git clone https://github.com/MostroP2P/mostro.git
-cd mostro
+git clone https://github.com/Konprostart/Satonero.git
+cd Satonero
 
 # Setup configuration
 mkdir -p docker/config

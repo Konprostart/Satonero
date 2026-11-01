@@ -1,6 +1,6 @@
-# Docker Guide for MostroP2P
+# Docker Guide for Satonero
 
-This guide provides instructions for building and running the MostroP2P application using Docker and Docker Compose.
+This guide provides instructions for building and running the Satonero daemon using Docker and Docker Compose.
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@ You need to have a LND node running locally. We recommend using [Polar](https://
 
 The `compose.yml` sets up the following services:
 
-- `mostro`: the MostroP2P service (standard build using `docker/Dockerfile`)
+- `mostro`: the Satonero daemon service (standard build using `docker/Dockerfile`)
 - `nostr-relay`: the Nostr relay
 
 StartOS users: install Mostro from the StartOS marketplace (one-click).
@@ -21,12 +21,12 @@ StartOS users: install Mostro from the StartOS marketplace (one-click).
 
 To build and run the Docker container using Docker Compose, follow these steps:
 
-### Steps for running the MostroP2P service and Nostr relay
+### Steps for running the Satonero daemon and Nostr relay
 
 1. Clone the repository:
 
    ```sh
-   git clone https://github.com/MostroP2P/mostro.git
+   git clone https://github.com/Konprostart/Satonero.git
    ```
 
 2. Ensure you have `settings.toml` (and, after running `make docker-build`, the LND cert and macaroon in `config/lnd/`) in a `config` directory. The `compose.yml` `volumes` section mounts `./config` (relative to the `docker/` directory) to `/config` in the container. On first run you only need `settings.toml`; Mostro creates `mostro.db` automatically. Create the config dir and copy the template as follows:
@@ -86,11 +86,11 @@ You can run the plain Mostro image without building locally. Use a single **conf
 
 1. Create a config directory and get the settings template:
 
-   **Option A — download the template** (from the [settings.tpl.toml](https://github.com/MostroP2P/mostro/blob/main/settings.tpl.toml) repo file):
+   **Option A — download the template** (from the [settings.tpl.toml](https://github.com/Konprostart/Satonero/blob/main/settings.tpl.toml) repo file):
 
    ```sh
    mkdir -p ~/mostro-config/lnd
-   curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o ~/mostro-config/settings.toml
+   curl -sL https://raw.githubusercontent.com/Konprostart/Satonero/main/settings.tpl.toml -o ~/mostro-config/settings.toml
    ```
 
    **Option B — use the entrypoint default:** run the container once with an empty config dir; the entrypoint copies a default `settings.toml` (from the image, built from `settings.tpl.toml`) into `/config`. Stop the container, edit the file on the host (e.g. `~/mostro-config/settings.toml`), then start the container again.
@@ -110,7 +110,7 @@ You can run the plain Mostro image without building locally. Use a single **conf
    docker run -d --name mostro \
      --add-host=host.docker.internal:host-gateway \
      -v ~/mostro-config:/config \
-     mostrop2p/mostro:latest
+     ghcr.io/konprostart/satonero:latest
    ```
 
    If you used Option B (empty config dir), edit the copied `settings.toml` and restart. Mostro creates `mostro.db` at startup when missing.
@@ -135,7 +135,7 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
    - Or download the template and copy it:
 
    ```sh
-   curl -sL https://raw.githubusercontent.com/MostroP2P/mostro/main/settings.tpl.toml -o /opt/mostro/settings.toml
+   curl -sL https://raw.githubusercontent.com/Konprostart/Satonero/main/settings.tpl.toml -o /opt/mostro/settings.toml
    ```
 
 4. **Put LND files** in the config dir so they appear at `/config/lnd/` in the container:
@@ -162,7 +162,7 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
      --restart unless-stopped \
      --add-host=host.docker.internal:host-gateway \
      -v /opt/mostro:/config \
-     mostrop2p/mostro:latest
+     ghcr.io/konprostart/satonero:latest
    ```
 
    - If LND is on a **different machine**, omit `--add-host` and use that machine’s hostname or IP in `lnd_grpc_host`:
@@ -171,12 +171,12 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker H
    docker run -d --name mostro \
      --restart unless-stopped \
      -v /opt/mostro:/config \
-     mostrop2p/mostro:latest
+     ghcr.io/konprostart/satonero:latest
    ```
 
 7. **Check logs**: `docker logs -f mostro`. Mostro will create `mostro.db` in the config dir on first run.
 
-8. **Optional**: Pin the image to a version, e.g. `mostrop2p/mostro:v0.16.2` instead of `:latest`.
+8. **Optional**: Pin the image to a version, e.g. `ghcr.io/konprostart/satonero:v0.0.0` instead of `:latest`.
 
 ## Stopping the Docker Container
 

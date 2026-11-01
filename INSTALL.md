@@ -67,8 +67,8 @@ apt-get install cmake build-essential libsqlite3-dev libssl-dev pkg-config git s
 ```bash
 cd /opt
 mkdir mostro
-git clone https://github.com/MostroP2P/mostro.git
-cd mostro
+git clone https://github.com/Konprostart/Satonero.git
+cd Satonero
 cargo build --release
 ```
 
