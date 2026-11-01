@@ -128,6 +128,25 @@ pub fn dev_fee_payments_enabled_for(networks: &[String], mostro_settings: &Mostr
     networks.first().map(String::as_str) == Some("mainnet")
 }
 
+/// The Lightning address dev fees are paid to.
+///
+/// Falls back to [`DEV_FEE_LIGHTNING_ADDRESS`] (the inherited upstream
+/// fund) when the operator has not set `dev_fee_lightning_address` in the
+/// settings. Fees are only ever paid when `dev_fee_enabled` is true AND
+/// the node runs on mainnet — see [`dev_fee_payments_enabled_for`].
+pub fn dev_fee_lightning_address() -> String {
+    dev_fee_lightning_address_for(Settings::get_mostro())
+}
+
+/// Pure variant of [`dev_fee_lightning_address`]: takes the settings
+/// explicitly so the fallback branch is unit-testable.
+pub fn dev_fee_lightning_address_for(mostro_settings: &MostroSettings) -> String {
+    mostro_settings
+        .dev_fee_lightning_address
+        .clone()
+        .unwrap_or_else(|| DEV_FEE_LIGHTNING_ADDRESS.to_string())
+}
+
 /// Run one full dev‑fee processing cycle.
 ///
 /// Called by the scheduler every tick. Phases run sequentially so each
@@ -1277,9 +1296,10 @@ pub async fn resolve_dev_fee_invoice(
     order: &Order,
     keys: &Keys,
 ) -> Result<(String, String), MostroError> {
+    let dev_fee_address = dev_fee_lightning_address();
     info!(
         "Resolving dev fee invoice for order {} - amount: {} sats to {}",
-        order.id, order.dev_fee, DEV_FEE_LIGHTNING_ADDRESS
+        order.id, order.dev_fee, dev_fee_address
     );
 
     if order.dev_fee <= 0 {
@@ -1292,11 +1312,7 @@ pub async fn resolve_dev_fee_invoice(
 
     let payment_request = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        resolv_ln_address(
-            DEV_FEE_LIGHTNING_ADDRESS,
-            order.dev_fee as u64,
-            Some(comment.as_str()),
-        ),
+        resolv_ln_address(&dev_fee_address, order.dev_fee as u64, Some(comment.as_str())),
     )
     .await
     .map_err(|_| {
@@ -3225,7 +3241,9 @@ mod tests {
 /// in the settings the node must not pay or charge dev fees at all.
 #[cfg(test)]
 mod dev_fee_gate_tests {
-    use super::dev_fee_payments_enabled_for;
+    use super::{
+        dev_fee_lightning_address_for, dev_fee_payments_enabled_for, DEV_FEE_LIGHTNING_ADDRESS,
+    };
     use crate::config::types::MostroSettings;
 
     fn disabled_settings() -> MostroSettings {
@@ -3267,5 +3285,36 @@ mod dev_fee_gate_tests {
             &enabled_settings()
         ));
         assert!(!dev_fee_payments_enabled_for(&[], &enabled_settings()));
+    }
+
+    #[test]
+    fn unset_dev_fee_address_falls_back_to_the_inherited_constant() {
+        // No operator override: the inherited fund address stays (and the
+        // settings gates above decide whether it is ever used).
+        assert_eq!(
+            dev_fee_lightning_address_for(&disabled_settings()),
+            crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS
+        );
+    }
+
+    #[test]
+    fn configured_dev_fee_address_overrides_the_fallback() {
+        let own = MostroSettings {
+            dev_fee_lightning_address: Some("fund@own-node.example".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            dev_fee_lightning_address_for(&own),
+            "fund@own-node.example".to_string()
+        );
+
+        // An empty string is a valid explicit choice: it is NOT silently
+        // replaced by the constant. LNURL resolution of an empty address
+        // fails fast when payments are enabled, instead of paying upstream.
+        let empty = MostroSettings {
+            dev_fee_lightning_address: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(dev_fee_lightning_address_for(&empty), String::new());
     }
 }

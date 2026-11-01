@@ -1,7 +1,7 @@
 use crate::config::constants::{
-    DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_AUDIT_EXPIRATION_DAYS, DEV_FEE_LIGHTNING_ADDRESS,
-    DM_EVENT_KIND,
+    DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_AUDIT_EXPIRATION_DAYS, DM_EVENT_KIND,
 };
+use crate::app::dev_fee::dev_fee_lightning_address;
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::types::MostroSettings;
 use crate::config::*;
@@ -833,7 +833,7 @@ pub async fn publish_dev_fee_audit_event(
         Tag::custom("order-id", vec![order.id.to_string()]),
         Tag::custom("amount", vec![order.dev_fee.to_string()]),
         Tag::custom("hash", vec![payment_hash.to_string()]),
-        Tag::custom("destination", vec![DEV_FEE_LIGHTNING_ADDRESS.to_string()]),
+        Tag::custom("destination", vec![dev_fee_lightning_address()]),
         Tag::custom("network", vec![ln_network]),
         Tag::custom(
             "y",
