@@ -154,8 +154,15 @@ max_orders_per_response = 10
 # Percentage of Mostro fee sent to development fund (0.30 means 30% of the Mostro fee)
 dev_fee_percentage = 0.30
 # Enable developer-fee payments independently of user trading fees
-# (true keeps the current behavior; false skips all developer-fee payments)
-dev_fee_enabled = true
+# (false skips all developer-fee payments: no LNURL resolution, no invoice
+# payment, no fee charge on orders, and no kind-8383 audit event). Satonero
+# disables this by default so a node never funds any development address
+# unintentionally; enable it deliberately and review the address below.
+dev_fee_enabled = false
+# Lightning address developer fees are paid to. Leave unset to use the
+# built-in fallback address; set your own to fund your own project (e.g.
+# `you@your-node.example.com`). Only meaningful when dev_fee_enabled = true.
+# dev_fee_lightning_address = 'you@your-node.example.com'
 # Serbero, the dispute assistant (https://github.com/MostroP2P/serbero), if you
 # run one: its public key, npub or hex. At startup Mostro registers it as a
 # read-only solver (it can talk to the parties but never settle or cancel) and
