@@ -9,13 +9,11 @@ name: Ortsom baseline
 # exactly what a baseline records; it only turns red when the pipeline
 # itself breaks before it can record anything.
 
+# Temporarily manual-only: the private MostroP2P/ortsom checkout is not
+# reachable from this repository, so every automatic run fails at its
+# checkout step. Restore the push and schedule blocks once the deploy key
+# has access to the private harness again.
 on:
-  push:
-    branches: [main]
-  schedule:
-    # Reruns on an unchanged `main` are intentional: they build the
-    # per-scenario history the verdict uses to set flaky scenarios aside.
-    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 # One baseline at a time. A push during a run waits instead of cancelling

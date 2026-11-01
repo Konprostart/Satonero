@@ -7,11 +7,11 @@ name: Ortsom PR
 # secrets and a read-only token, and never sees Ortsom: that is what lets it
 # run a fork's code.
 
+# Temporarily manual-only: downstream ortsom-pr-run.yml needs the private
+# MostroP2P/ortsom harness, which is not reachable from this repository.
+# Restore the pull_request trigger when the harness is accessible again.
 on:
-  pull_request:
-    branches: [main]
-    # converted_to_draft takes the skip path, which cancels a suite in flight.
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+  workflow_dispatch:
 
 permissions:
   contents: read

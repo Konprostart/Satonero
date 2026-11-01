@@ -10,10 +10,10 @@ name: Ortsom PR run
 # `verdict` compares the result with the baseline of `main` and reports it
 # as one `ortsom:*` label and a sticky comment. Shadow mode: it never closes.
 
+# Temporarily manual-only: the suite fetches the private MostroP2P/ortsom
+# harness, which is not reachable from this repository. Restore the
+# workflow_run trigger when the harness is accessible again.
 on:
-  workflow_run:
-    workflows: [Ortsom PR]
-    types: [completed]
   # For maintainers: re-run the trusted side for one `Ortsom PR` run.
   workflow_dispatch:
     inputs:
