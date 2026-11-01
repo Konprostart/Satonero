@@ -3,6 +3,7 @@ use crate::config::constants::{
     DM_EVENT_KIND,
 };
 use crate::config::settings::{get_db_pool, Settings};
+use crate::config::types::MostroSettings;
 use crate::config::*;
 use crate::db;
 use crate::db::{claim_order_status, is_user_present};
@@ -118,7 +119,13 @@ pub fn calculate_dev_fee(total_mostro_fee: i64, percentage: f64) -> i64 {
 /// The returned value should be split 50/50 between buyer and seller
 /// Returns the total amount in satoshis for the dev fund
 pub fn get_dev_fee(total_mostro_fee: i64) -> i64 {
-    let mostro_settings = Settings::get_mostro();
+    dev_fee_for_settings(total_mostro_fee, Settings::get_mostro())
+}
+
+/// Pure variant of [`get_dev_fee`]: same disabled-dev-fee logic, but
+/// taking the settings explicitly so the `dev_fee_enabled = false` branch
+/// is unit-testable without racing other tests for the set-once global.
+pub fn dev_fee_for_settings(total_mostro_fee: i64, mostro_settings: &MostroSettings) -> i64 {
     if !mostro_settings.dev_fee_enabled {
         return 0;
     }
@@ -3329,6 +3336,31 @@ mod tests {
         init_globals();
         // Both candidate global configs carry dev_fee_percentage = 0.30.
         assert_eq!(get_dev_fee(1_000), 300);
+    }
+
+    #[test]
+    fn disabled_dev_fee_returns_zero() {
+        let settings = MostroSettings {
+            dev_fee_enabled: false,
+            dev_fee_percentage: 0.30,
+            ..Default::default()
+        };
+        // No order size escapes the switch: with dev fee disabled the node
+        // must charge nothing at all.
+        assert_eq!(dev_fee_for_settings(1_000, &settings), 0);
+        assert_eq!(dev_fee_for_settings(i64::MAX, &settings), 0);
+        assert_eq!(dev_fee_for_settings(0, &settings), 0);
+    }
+
+    #[test]
+    fn enabled_dev_fee_still_applies_percentage() {
+        let settings = MostroSettings {
+            dev_fee_enabled: true,
+            dev_fee_percentage: 0.30,
+            ..Default::default()
+        };
+        // Same inputs through the pure entry point must match the global one.
+        assert_eq!(dev_fee_for_settings(1_000, &settings), 300);
     }
 
     #[test]
