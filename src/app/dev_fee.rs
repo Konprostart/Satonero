@@ -1312,7 +1312,11 @@ pub async fn resolve_dev_fee_invoice(
 
     let payment_request = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        resolv_ln_address(&dev_fee_address, order.dev_fee as u64, Some(comment.as_str())),
+        resolv_ln_address(
+            &dev_fee_address,
+            order.dev_fee as u64,
+            Some(comment.as_str()),
+        ),
     )
     .await
     .map_err(|_| {
@@ -3242,7 +3246,7 @@ mod tests {
 #[cfg(test)]
 mod dev_fee_gate_tests {
     use super::{
-        dev_fee_lightning_address_for, dev_fee_payments_enabled_for, DEV_FEE_LIGHTNING_ADDRESS,
+        dev_fee_lightning_address_for, dev_fee_payments_enabled_for,
     };
     use crate::config::types::MostroSettings;
 

@@ -1,7 +1,7 @@
+use crate::app::dev_fee::dev_fee_lightning_address;
 use crate::config::constants::{
     DEV_FEE_AUDIT_EVENT_KIND, DEV_FEE_AUDIT_EXPIRATION_DAYS, DM_EVENT_KIND,
 };
-use crate::app::dev_fee::dev_fee_lightning_address;
 use crate::config::settings::{get_db_pool, Settings};
 use crate::config::types::MostroSettings;
 use crate::config::*;
