@@ -80,7 +80,7 @@ To build and run the Docker container using Docker Compose, follow these steps:
    make docker-up
    ```
 
-## Running the plain image from Docker Hub
+## Running the plain image from GHCR
 
 You can run the plain Mostro image without building locally. Use a single **config directory** on the host and mount it at `/config` in the container. Paths in `settings.toml` are **inside the container**, so use `/config/...` for certs, macaroon, and database.
 
@@ -119,7 +119,7 @@ You can run the plain Mostro image without building locally. Use a single **conf
 
 ## Running plain Mostro on a VPS
 
-Steps to run the plain Mostro image on a VPS (no repo clone; image from Docker Hub).
+Steps to run the plain Mostro image on a VPS (no repo clone; image from GHCR).
 
 1. **Install Docker** on the VPS (e.g. [Docker Engine](https://docs.docker.com/engine/install/)).
 
