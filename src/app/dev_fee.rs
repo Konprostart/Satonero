@@ -3245,9 +3245,7 @@ mod tests {
 /// in the settings the node must not pay or charge dev fees at all.
 #[cfg(test)]
 mod dev_fee_gate_tests {
-    use super::{
-        dev_fee_lightning_address_for, dev_fee_payments_enabled_for,
-    };
+    use super::{dev_fee_lightning_address_for, dev_fee_payments_enabled_for};
     use crate::config::types::MostroSettings;
 
     fn disabled_settings() -> MostroSettings {
