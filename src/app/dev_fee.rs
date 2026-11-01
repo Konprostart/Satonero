@@ -80,6 +80,7 @@
 use crate::app::health::lnd_sync::LndSyncState;
 use crate::config::constants::DEV_FEE_LIGHTNING_ADDRESS;
 use crate::config::settings::Settings;
+use crate::config::types::MostroSettings;
 use crate::db::find_unpaid_dev_fees;
 use crate::lightning::invoice::{decode_invoice, validate_payout_invoice};
 use crate::lightning::LndConnector;
@@ -114,7 +115,14 @@ const DEV_FEE_RETRY_JITTER: f64 = 0.25;
 /// other chain every cycle would resolve it over LNURL just to reject the
 /// invoice for the wrong currency (#1039). Unknown chains fail closed.
 pub fn dev_fee_payments_enabled(networks: &[String]) -> bool {
-    if !Settings::get_mostro().dev_fee_enabled {
+    dev_fee_payments_enabled_for(networks, Settings::get_mostro())
+}
+
+/// Pure variant of [`dev_fee_payments_enabled`]: takes the settings
+/// explicitly so the `dev_fee_enabled = false` branch is unit-testable
+/// without racing other tests for the set-once global.
+pub fn dev_fee_payments_enabled_for(networks: &[String], mostro_settings: &MostroSettings) -> bool {
+    if !mostro_settings.dev_fee_enabled {
         return false;
     }
     networks.first().map(String::as_str) == Some("mainnet")
@@ -3210,5 +3218,54 @@ mod tests {
         let mut ln = dead_lnd().await;
         let result = send_dev_fee_payment(&order, &invoice, &mut ln).await;
         assert!(result.is_err(), "dead endpoint must fail the send");
+    }
+}
+
+/// Gate-level tests for the dev-fee switch: with `dev_fee_enabled = false`
+/// in the settings the node must not pay or charge dev fees at all.
+#[cfg(test)]
+mod dev_fee_gate_tests {
+    use super::dev_fee_payments_enabled_for;
+    use crate::config::types::MostroSettings;
+
+    fn disabled_settings() -> MostroSettings {
+        MostroSettings {
+            dev_fee_enabled: false,
+            ..Default::default()
+        }
+    }
+
+    fn enabled_settings() -> MostroSettings {
+        MostroSettings {
+            dev_fee_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disabled_settings_block_dev_fee_payments_on_any_network() {
+        for networks in [
+            vec!["mainnet".to_string()],
+            vec!["regtest".to_string()],
+            vec![],
+        ] {
+            assert!(
+                !dev_fee_payments_enabled_for(&networks, &disabled_settings()),
+                "dev_fee_enabled = false must block payments for networks {networks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_settings_keep_the_network_gate_in_force() {
+        assert!(dev_fee_payments_enabled_for(
+            &["mainnet".to_string()],
+            &enabled_settings()
+        ));
+        assert!(!dev_fee_payments_enabled_for(
+            &["regtest".to_string()],
+            &enabled_settings()
+        ));
+        assert!(!dev_fee_payments_enabled_for(&[], &enabled_settings()));
     }
 }

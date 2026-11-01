@@ -531,6 +531,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dev_fee_enabled_switches_on_explicit_toml_and_defaults_true() {
+        // Mirror of the `[mostro]` section of settings.tpl.toml as it ships.
+        let base = "fee = 0\n\
+                    max_routing_fee = 0.002\n\
+                    max_order_amount = 1000000\n\
+                    min_payment_amount = 100\n\
+                    expiration_hours = 24\n\
+                    max_expiration_days = 15\n\
+                    expiration_seconds = 900\n\
+                    user_rates_sent_interval_seconds = 3600\n\
+                    publish_relays_interval = 60\n\
+                    pow = 0\n\
+                    publish_mostro_info_interval = 300\n\
+                    bitcoin_price_api_url = \"https://api.yadio.io\"\n\
+                    fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']\n\
+                    max_orders_per_response = 10\n\
+                    dev_fee_percentage = 0.30\n\
+                    dev_fee_enabled = true";
+        // The shipped template keeps the fund enabled (backward compat).
+        let template: MostroSettings = toml::from_str(base).unwrap();
+        assert!(template.dev_fee_enabled);
+        assert_eq!(template.dev_fee_percentage, 0.30);
+
+        // The operator switch: removing that one key (serde default true)
+        // and writing `false` instead must disable the dev fee.
+        let switched_off: MostroSettings = toml::from_str(
+            "fee = 0\n\
+             max_routing_fee = 0.002\n\
+             max_order_amount = 1000000\n\
+             min_payment_amount = 100\n\
+             expiration_hours = 24\n\
+             max_expiration_days = 15\n\
+             expiration_seconds = 900\n\
+             user_rates_sent_interval_seconds = 3600\n\
+             publish_relays_interval = 60\n\
+             pow = 0\n\
+             publish_mostro_info_interval = 300\n\
+             bitcoin_price_api_url = \"https://api.yadio.io\"\n\
+             fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']\n\
+             max_orders_per_response = 10\n\
+             dev_fee_percentage = 0.30\n\
+             dev_fee_enabled = false",
+        )
+        .unwrap();
+        assert!(!switched_off.dev_fee_enabled);
+
+        // Omitting the key entirely must keep the compatibility default.
+        let omitted: MostroSettings = toml::from_str(
+            "fee = 0\n\
+             max_routing_fee = 0.002\n\
+             max_order_amount = 1000000\n\
+             min_payment_amount = 100\n\
+             expiration_hours = 24\n\
+             max_expiration_days = 15\n\
+             expiration_seconds = 900\n\
+             user_rates_sent_interval_seconds = 3600\n\
+             publish_relays_interval = 60\n\
+             pow = 0\n\
+             publish_mostro_info_interval = 300\n\
+             bitcoin_price_api_url = \"https://api.yadio.io\"\n\
+             fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']\n\
+             max_orders_per_response = 10\n\
+             dev_fee_percentage = 0.30",
+        )
+        .unwrap();
+        assert!(omitted.dev_fee_enabled);
+    }
+
+    #[test]
     fn rating_kind_uses_configured_days() {
         let settings = ExpirationSettings {
             rating_days: Some(30),
