@@ -658,6 +658,15 @@ bitcoin_price_api_url = "https://api.yadio.io"
 - `pow_first_contact`: A stiffer PoW for senders not yet part of an active trade (anti-spam, checked before decryption)
 - `fiat_currencies_accepted`: Restrict supported currencies (empty array = accept all)
 
+> **Existing operators: set the developer fee explicitly.** If your `settings.toml` was created before the `dev_fee_enabled` key existed, the daemon treats the developer fee as **enabled** when that key is missing. To disable it, add these lines under `[mostro]`:
+>
+> ```toml
+> dev_fee_enabled = false
+> dev_fee_percentage = 0.30   # must stay >= 0.10 (startup validation), even when disabled
+> ```
+>
+> `dev_fee_percentage` must remain between 0.10 and 1.0 because the daemon validates it at startup even when `dev_fee_enabled = false`. Existing configuration files are not changed automatically; set the keys yourself.
+
 ---
 
 #### RPC Interface (Optional)
