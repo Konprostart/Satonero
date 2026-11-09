@@ -36,7 +36,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 
 # Build the project in release mode
-RUN cargo build --release
+RUN cargo build --release --bin mostrod --bin stagea_dm_diag
 
 # Production stage
 FROM debian:bookworm-slim
@@ -49,6 +49,7 @@ RUN useradd -m mostrouser
 
 # Copy built binary from build stage
 COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod
+COPY --from=builder /mostro/target/release/stagea_dm_diag /usr/local/bin/stagea_dm_diag
 
 WORKDIR /home/mostrouser
 
