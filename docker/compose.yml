@@ -3,6 +3,10 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # Build the opt-in diagnostic target so the local/regtest image also
+      # carries stagea_dm_diag. Release images are built from the Dockerfile
+      # without a target and stay mostrod-only.
+      target: diag
     volumes:
       - ./config:/config  # settings.toml and mostro.db
     platform: linux/amd64

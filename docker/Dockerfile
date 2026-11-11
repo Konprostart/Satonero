@@ -38,8 +38,8 @@ COPY . .
 # Build the project in release mode
 RUN cargo build --release --bin mostrod --bin stagea_dm_diag
 
-# Production stage
-FROM debian:bookworm-slim
+# Production base stage: the published runtime image.
+FROM debian:bookworm-slim AS runtime-base
 
 # Install dependencies
 RUN apt-get update && apt-get install -y --reinstall ca-certificates
@@ -49,7 +49,6 @@ RUN useradd -m mostrouser
 
 # Copy built binary from build stage
 COPY --from=builder /mostro/target/release/mostrod /usr/local/bin/mostrod
-COPY --from=builder /mostro/target/release/stagea_dm_diag /usr/local/bin/stagea_dm_diag
 
 WORKDIR /home/mostrouser
 
@@ -69,3 +68,15 @@ USER mostrouser
 
 # Start mostro
 CMD ["./start.sh"]
+
+# Diagnostic stage: an opt-in build target used by the Phase 5A harness
+# (docker/compose.yml builds `--target diag`). The published images are built
+# from this Dockerfile without a target, i.e. from the final `runtime` stage
+# below, so the standalone DM helper never ships in a release image.
+FROM runtime-base AS diag
+COPY --from=builder /mostro/target/release/stagea_dm_diag /usr/local/bin/stagea_dm_diag
+
+# Production stage: the default build target, because it is the last stage.
+# It is the runtime base with no extra binaries; keeping it last is what makes
+# a plain `docker build` (and the release workflow) mostrod-only.
+FROM runtime-base AS runtime
