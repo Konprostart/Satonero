@@ -148,3 +148,8 @@ uncovered = "no ortsom scenario yet"
 name = "misc daemon entry points"
 paths = ["src/cli.rs", "src/lnurl.rs"]
 uncovered = "no ortsom scenario yet (the stack pays bolt11 invoices, never LNURL)"
+
+[[rule]]
+name = "stage A DM diagnostic"
+paths = ["src/bin/stagea_dm_diag.rs"]
+uncovered = "standalone Stage A DM diagnostic helper; not part of mostrod or any Ortsom scenario"
