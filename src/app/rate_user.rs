@@ -600,6 +600,45 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_variables_for_vote_buyer_returns_rated_trade_pubkey() {
+        // The kind 38384 rating event is keyed by the *rated* user's trade
+        // pubkey. A buyer's rating therefore targets the seller's trade key.
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let order = create_test_order(
+            Status::Success,
+            seller_keys.public_key(),
+            buyer_keys.public_key(),
+        );
+
+        let (rated_trade_pubkey, buyer_rating, seller_rating) =
+            prepare_variables_for_vote(&buyer_keys.public_key().to_string(), &order).unwrap();
+
+        assert!(buyer_rating);
+        assert!(!seller_rating);
+        assert_eq!(rated_trade_pubkey, seller_keys.public_key().to_string());
+    }
+
+    #[test]
+    fn test_prepare_variables_for_vote_seller_returns_rated_trade_pubkey() {
+        // A seller's rating targets the buyer's trade key.
+        let seller_keys = create_test_keys();
+        let buyer_keys = create_test_keys();
+        let order = create_test_order(
+            Status::Success,
+            seller_keys.public_key(),
+            buyer_keys.public_key(),
+        );
+
+        let (rated_trade_pubkey, buyer_rating, seller_rating) =
+            prepare_variables_for_vote(&seller_keys.public_key().to_string(), &order).unwrap();
+
+        assert!(!buyer_rating);
+        assert!(seller_rating);
+        assert_eq!(rated_trade_pubkey, buyer_keys.public_key().to_string());
+    }
+
+    #[test]
     fn test_rating_validation_success_status() {
         let seller_keys = create_test_keys();
         let buyer_keys = create_test_keys();
