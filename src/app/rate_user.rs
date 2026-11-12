@@ -4,11 +4,18 @@ use crate::util::{enqueue_order_msg, first_trade_since, get_order, update_user_r
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 
+/// Resolve the trade pubkey of the user being rated and which side is rating.
+///
+/// The kind 38384 rating event is a NIP-33 addressable event whose `d` tag is
+/// the *rated* user's trade pubkey (`protocol/src/user_rating.md`). A buyer's
+/// rating therefore resolves the seller's trade key, and a seller's rating the
+/// buyer's trade key. Publishing the rater's own trade key would attach the
+/// rated user's aggregate to the wrong address.
 pub fn prepare_variables_for_vote(
     message_sender: &str,
     order: &Order,
 ) -> Result<(String, bool, bool), MostroError> {
-    let mut counterpart_trade_pubkey: String = String::new();
+    let mut rated_trade_pubkey: String = String::new();
     let mut buyer_rating: bool = false;
     let mut seller_rating: bool = false;
 
@@ -19,22 +26,23 @@ pub fn prepare_variables_for_vote(
         (_, None) => return Err(MostroInternalErr(ServiceError::InvalidPubkey)),
     };
 
-    // Find the counterpart public key
+    // Find the trade pubkey of the user being rated: the counterpart of the
+    // sender, never the sender's own key.
     if message_sender == buyer {
         buyer_rating = true;
-        counterpart_trade_pubkey = order
-            .get_buyer_pubkey()
+        rated_trade_pubkey = order
+            .get_seller_pubkey()
             .map_err(MostroInternalErr)?
             .to_string();
     } else if message_sender == seller {
         seller_rating = true;
-        counterpart_trade_pubkey = order
-            .get_seller_pubkey()
+        rated_trade_pubkey = order
+            .get_buyer_pubkey()
             .map_err(MostroInternalErr)?
             .to_string();
     };
 
-    Ok((counterpart_trade_pubkey, buyer_rating, seller_rating))
+    Ok((rated_trade_pubkey, buyer_rating, seller_rating))
 }
 
 /// Updates a user's reputation based on a rating received from a trade counterpart.
@@ -77,7 +85,7 @@ pub async fn update_user_reputation_action(
     let order = get_order(&msg, pool).await?;
 
     // Prepare variables for vote
-    let (counterpart_trade_pubkey, buyer_rating, seller_rating) =
+    let (rated_trade_pubkey, buyer_rating, seller_rating) =
         prepare_variables_for_vote(&event.sender.to_string(), &order)?;
 
     // Check if order is success, but sellers can rate in status settled-hold-invoice
@@ -177,7 +185,7 @@ pub async fn update_user_reputation_action(
     let reputation_event = rating_event_tags(&user_to_vote);
 
     if buyer_rating || seller_rating {
-        update_user_rating_event(&counterpart_trade_pubkey, reputation_event, my_keys).await?;
+        update_user_rating_event(&rated_trade_pubkey, reputation_event, my_keys).await?;
 
         enqueue_order_msg(
             msg.get_inner_message_kind().request_id,
