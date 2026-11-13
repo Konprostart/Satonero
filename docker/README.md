@@ -84,6 +84,8 @@ To build and run the Docker container using Docker Compose, follow these steps:
 
 You can run the plain Mostro image without building locally. Use a single **config directory** on the host and mount it at `/config` in the container. Paths in `settings.toml` are **inside the container**, so use `/config/...` for certs, macaroon, and database.
 
+> **Image tags.** The workflows publish `ghcr.io/konprostart/satonero` and `ghcr.io/konprostart/satonero-startos` as `dev-<short-sha>` for every push, and `latest` once a signed `vX.Y.Z` release has been published to GHCR. This repository has no release tag yet, so `:latest` does not exist at the time of writing: use a `dev-<short-sha>` tag from the package page, or build the image locally with the steps above.
+
 1. Create a config directory and get the settings template:
 
    **Option A — download the template** (from the [settings.tpl.toml](https://github.com/Konprostart/Satonero/blob/main/settings.tpl.toml) repo file):
@@ -176,7 +178,7 @@ Steps to run the plain Mostro image on a VPS (no repo clone; image from GHCR).
 
 7. **Check logs**: `docker logs -f mostro`. Mostro will create `mostro.db` in the config dir on first run.
 
-8. **Optional**: Pin the image to a version, e.g. `ghcr.io/konprostart/satonero:v0.0.0` instead of `:latest`.
+8. **Optional**: Pin the image to a published release tag, e.g. `ghcr.io/konprostart/satonero:v1.2.3` instead of `:latest`. Release tags are created from this repository's `vX.Y.Z` tags; see the tag note in the previous section, because no release tag exists yet.
 
 ## Stopping the Docker Container
 
