@@ -280,6 +280,15 @@ jobs:
               | head -n "$max_candidates"
           )
 
+          # No vX.Y.Z tag exists yet (pre-release repository state). That is a
+          # legitimate "nothing to promote", not the broken state the final
+          # check guards: `latest` simply stays where it is. Failing here would
+          # fail every dry run and every dev-tag build before the first release.
+          if [[ "${#candidates[@]}" -eq 0 ]]; then
+            echo "::notice::no vX.Y.Z release tag exists yet; latest is left untouched"
+            exit 0
+          fi
+
           # A missing manifest is the only failure that means "not published
           # yet". Reading a rate limit, a 5xx or an expired token as absence
           # would skip the newest release and move `latest` back to an older
