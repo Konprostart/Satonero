@@ -3333,9 +3333,36 @@ mod tests {
 
     #[test]
     fn dev_fee_uses_configured_percentage() {
+        // Opt in explicitly through the pure entry point: the node default is
+        // disabled, and the shared global settings must not decide the result.
+        let settings = MostroSettings {
+            dev_fee_enabled: true,
+            dev_fee_percentage: 0.50,
+            ..Default::default()
+        };
+        assert_eq!(dev_fee_for_settings(1_000, &settings), 500);
+    }
+
+    #[test]
+    fn default_settings_charge_no_dev_fee() {
+        // Without an explicit opt-in the calculated dev fee is zero for every
+        // fee size, so no order records a dev fee to pay.
+        let settings = MostroSettings::default();
+        assert!(!settings.dev_fee_enabled);
+        assert_eq!(dev_fee_for_settings(1_000, &settings), 0);
+        assert_eq!(dev_fee_for_settings(i64::MAX, &settings), 0);
+        // The percentage itself is untouched and still validated at startup.
+        assert_eq!(settings.dev_fee_percentage, 0.30);
+    }
+
+    #[test]
+    fn global_default_settings_charge_no_dev_fee() {
         init_globals();
-        // Both candidate global configs carry dev_fee_percentage = 0.30.
-        assert_eq!(get_dev_fee(1_000), 300);
+        // Both candidate global test configs use `MostroSettings::default()`,
+        // whose dev fee is disabled: the take flows record `dev_fee = 0`.
+        assert_eq!(get_dev_fee(1_000), 0);
+        // The ordinary Mostro fee path is unchanged.
+        assert_eq!(get_fee(1_000), 0);
     }
 
     #[test]

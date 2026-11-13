@@ -53,7 +53,7 @@ While @lnp2pBot works excellently, it relies on Telegram—a platform potentiall
 - **Anti-Abuse Bond** - Optional, opt-in Lightning hold-invoice bond for makers and/or takers; released on honest trades, slashed only on a solver dispute directive or a waiting-state timeout (off by default — see [docs/ANTI_ABUSE_BOND.md](docs/ANTI_ABUSE_BOND.md))
 
 ### Advanced Features
-- **Development Fee System** - Transparent fee collection with Nostr audit events (kind 8383)
+- **Development Fee System** - Optional, off by default; when an operator opts in, fees are published as Nostr audit events (kind 8383)
 - **RPC Admin Interface** - gRPC interface for direct daemon management and dispute handling
 - **Background Scheduler** - Automated order expiration, payment retries, and dev fee processing
 - **Multi-Currency Support** - Configurable fiat currency list with real-time price feeds
@@ -254,7 +254,10 @@ warn users before they trade.
 
 ### Development Fee Distribution
 
-Mostro implements a transparent development sustainability model:
+The development fee is **optional and disabled by default**. A node pays nothing
+to any development fund unless its operator sets `dev_fee_enabled = true` under
+`[mostro]` (and, even then, only on a mainnet Lightning node). The flow below
+describes what happens **only after an operator has opted in**:
 
 ```mermaid
 sequenceDiagram
@@ -290,7 +293,8 @@ sequenceDiagram
     Fund->>Fund: Dev fund receives 300 sats (30%)
 ```
 
-**Transparency Features**:
+**Transparency Features** (when enabled):
+- **Opt-in**: `dev_fee_enabled` defaults to `false`; a missing key also means disabled
 - **Configurable**: Node operators set `dev_fee_percentage` (min 10%, max 100%, default 30%)
 - **Non-Blocking**: Failed payments don't prevent order completion; retries automatic
 - **Auditable**: All dev fee payments published to Nostr (kind 8383 events)
@@ -641,8 +645,14 @@ pow = 0  # Set to 10-20 to prevent spam
 # (unset = same as `pow`).
 # pow_first_contact = 16
 
-# Development sustainability fee (0.30 = 30% of Mostro fee goes to dev fund)
+# Development sustainability fee: share of the Mostro fee that goes to a dev
+# fund *if* dev_fee_enabled = true (0.30 = 30%)
 dev_fee_percentage = 0.30      # Minimum: 0.10 (10%), Maximum: 1.0 (100%)
+
+# Opt-in switch. Disabled by default; a missing key also means disabled.
+# Set to true only if you deliberately want to pay a development fund.
+dev_fee_enabled = false
+# dev_fee_lightning_address = 'you@your-node.example.com'   # only used when enabled
 
 # Fiat currency whitelist (empty = accept all)
 fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'BRL']
@@ -653,19 +663,21 @@ bitcoin_price_api_url = "https://api.yadio.io"
 
 **Key Settings**:
 - `fee`: Your Mostro's fee percentage (default 0.6% split between buyer/seller)
-- `dev_fee_percentage`: Portion of your fee donated to Mostro development (default 30%)
+- `dev_fee_enabled`: Opt-in switch for development fee payments (default `false`; a missing key means disabled)
+- `dev_fee_percentage`: Portion of your fee that would go to the development fund **if** `dev_fee_enabled = true` (default 30%); always validated at startup, even when the fee is disabled
 - `pow`: Increase to 10-20 if experiencing spam (higher = slower client messages)
 - `pow_first_contact`: A stiffer PoW for senders not yet part of an active trade (anti-spam, checked before decryption)
 - `fiat_currencies_accepted`: Restrict supported currencies (empty array = accept all)
 
-> **Existing operators: set the developer fee explicitly.** If your `settings.toml` was created before the `dev_fee_enabled` key existed, the daemon treats the developer fee as **enabled** when that key is missing. To disable it, add these lines under `[mostro]`:
+> **The developer fee is off unless you turn it on.** If `dev_fee_enabled` is missing from your `settings.toml` (for example a file created before the key existed), the daemon treats the developer fee as **disabled**: no fee is added to orders, no payment is scheduled, and no development address is contacted. To opt in deliberately, add this under `[mostro]`:
 >
 > ```toml
-> dev_fee_enabled = false
-> dev_fee_percentage = 0.30   # must stay >= 0.10 (startup validation), even when disabled
+> dev_fee_enabled = true
+> dev_fee_percentage = 0.30                          # 0.10 to 1.0
+> dev_fee_lightning_address = 'you@your-node.example.com'
 > ```
 >
-> `dev_fee_percentage` must remain between 0.10 and 1.0 because the daemon validates it at startup even when `dev_fee_enabled = false`. Existing configuration files are not changed automatically; set the keys yourself.
+> Without `dev_fee_lightning_address`, an enabled fee on mainnet is paid to the address compiled into the binary (`DEV_FEE_LIGHTNING_ADDRESS`, an upstream Mostro address), so set your own address when you opt in. Fees are only ever paid when the node is on mainnet. `dev_fee_percentage` must stay between 0.10 and 1.0 because the daemon validates it at startup even when `dev_fee_enabled = false`. Existing configuration files are not changed automatically.
 
 ---
 
@@ -711,7 +723,7 @@ sqlite3 ~/.mostro/mostro.db
 1. **Never commit `settings.toml`** - Contains private keys and credentials
 2. **Validate config on startup** - Mostro will refuse to start with invalid settings
 3. **Update after schema changes** - Run `cargo sqlx migrate run` after pulling updates
-4. **Monitor dev fee payments** - Check logs: `journalctl -u mostro | grep "dev_fee"`
+4. **Monitor dev fee payments** (only if you enabled them) - Check logs: `journalctl -u mostro | grep "dev_fee"`
 5. **Adjust PoW for load** - Start at 0, increase to 15-20 if spam becomes an issue
 
 For complete settings reference, see [settings.tpl.toml](settings.tpl.toml).
@@ -811,7 +823,7 @@ grpcurl -plaintext -d '{"solver_pubkey": "npub1..."}' localhost:50051 mostro.adm
 
 ### Querying Audit Events
 
-Development fee payments are auditable via Nostr (kind 8383):
+If you have opted in with `dev_fee_enabled = true`, development fee payments are auditable via Nostr (kind 8383). Nodes with the fee disabled (the default) publish none:
 
 ```bash
 # Get all dev fee payments from your Mostro
@@ -1271,9 +1283,9 @@ While Mostro is not a company, the rewards program enables us to thank collabora
 
 ### Development Sustainability
 
-As of v0.15.6, Mostro includes a transparent development fee system where Mostro operators contribute a configurable percentage (default 30%, minimum 10%) of their fee income to the development fund. This ensures long-term sustainability while maintaining the project's open-source ethos.
+Since v0.15.6, the daemon includes a transparent, **optional** development fee system. It is disabled by default (`dev_fee_enabled = false`, and a missing key also means disabled). An operator who deliberately opts in contributes a configurable percentage (default 30%, minimum 10%) of the Mostro fee to a development fund; the fee is only paid on mainnet.
 
-All development fee payments are published to Nostr (kind 8383 events) for public verification. See [docs/DEV_FEE.md](docs/DEV_FEE.md) for complete details.
+When enabled, every development fee payment is published to Nostr (kind 8383 events) for public verification. See [docs/DEV_FEE.md](docs/DEV_FEE.md) for complete details.
 
 ## Maintainers
 

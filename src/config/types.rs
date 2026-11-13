@@ -401,8 +401,11 @@ fn default_health_enabled() -> bool {
     true
 }
 
+/// A node never pays a development fund unless its operator opts in with
+/// `dev_fee_enabled = true`. Keep this in sync with
+/// `MostroSettings::default()` and `settings.tpl.toml`.
 fn default_dev_fee_enabled() -> bool {
-    true
+    false
 }
 
 /// Default seconds between health event publications.
@@ -531,7 +534,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dev_fee_enabled_switches_on_explicit_toml_and_defaults_true() {
+    fn dev_fee_enabled_switches_on_explicit_toml_and_defaults_false() {
         // Mirror of the `[mostro]` section of settings.tpl.toml as it ships:
         // Satonero disables the fund by default so a node never pays an
         // inherited dev address unintentionally.
@@ -556,8 +559,8 @@ mod tests {
         assert_eq!(template.dev_fee_percentage, 0.30);
         assert_eq!(template.dev_fee_lightning_address, None);
 
-        // Omitting the key keeps the compatibility default for configs
-        // written against older templates.
+        // Omitting the key disables the fee, including for configs written
+        // against older templates: opting in must be deliberate.
         let legacy = "fee = 0\n\
                     max_routing_fee = 0.002\n\
                     max_order_amount = 1000000\n\
@@ -574,7 +577,7 @@ mod tests {
                     max_orders_per_response = 10\n\
                     dev_fee_percentage = 0.30";
         let legacy: MostroSettings = toml::from_str(legacy).unwrap();
-        assert!(legacy.dev_fee_enabled);
+        assert!(!legacy.dev_fee_enabled);
 
         // The operator switch and the address override both win over
         // defaults.
@@ -603,6 +606,83 @@ mod tests {
             overridden.dev_fee_lightning_address,
             Some("satoshi@own-node.example".to_string())
         );
+    }
+
+    /// `[mostro]` TOML shared by the dev-fee default tests: every required
+    /// key, and deliberately no `dev_fee_enabled`.
+    const MOSTRO_TOML_WITHOUT_DEV_FEE_SWITCH: &str = "fee = 0\n\
+                    max_routing_fee = 0.002\n\
+                    max_order_amount = 1000000\n\
+                    min_payment_amount = 100\n\
+                    expiration_hours = 24\n\
+                    max_expiration_days = 15\n\
+                    expiration_seconds = 900\n\
+                    user_rates_sent_interval_seconds = 3600\n\
+                    publish_relays_interval = 60\n\
+                    pow = 0\n\
+                    publish_mostro_info_interval = 300\n\
+                    bitcoin_price_api_url = \"https://api.yadio.io\"\n\
+                    fiat_currencies_accepted = ['USD', 'EUR', 'ARS', 'CUP']\n\
+                    max_orders_per_response = 10\n\
+                    dev_fee_percentage = 0.30\n";
+
+    #[test]
+    fn dev_fee_is_disabled_in_every_code_default() {
+        // Two independent defaults exist: the `Default` impl (used by the
+        // wizard and by tests) and the serde default (used for a
+        // `settings.toml` that omits the key). Both must stay `false`.
+        assert!(!MostroSettings::default().dev_fee_enabled);
+        assert!(!default_dev_fee_enabled());
+        // Disabled by default must not change the configured percentage,
+        // which is still validated at startup.
+        assert_eq!(MostroSettings::default().dev_fee_percentage, 0.30);
+        assert_eq!(MostroSettings::default().dev_fee_lightning_address, None);
+    }
+
+    #[test]
+    fn missing_dev_fee_enabled_key_resolves_to_false() {
+        let parsed: MostroSettings = toml::from_str(MOSTRO_TOML_WITHOUT_DEV_FEE_SWITCH).unwrap();
+        assert!(!parsed.dev_fee_enabled);
+    }
+
+    #[test]
+    fn explicit_dev_fee_enabled_values_are_honoured() {
+        let enabled: MostroSettings = toml::from_str(&format!(
+            "{MOSTRO_TOML_WITHOUT_DEV_FEE_SWITCH}dev_fee_enabled = true"
+        ))
+        .unwrap();
+        assert!(enabled.dev_fee_enabled, "explicit opt-in must still work");
+
+        let disabled: MostroSettings = toml::from_str(&format!(
+            "{MOSTRO_TOML_WITHOUT_DEV_FEE_SWITCH}dev_fee_enabled = false"
+        ))
+        .unwrap();
+        assert!(!disabled.dev_fee_enabled);
+    }
+
+    #[test]
+    fn interactive_wizard_settings_serialize_dev_fee_disabled() {
+        // `prompt_mostro_settings` in `wizard.rs` returns exactly this shape:
+        // two prompted values on top of `MostroSettings::default()`, which
+        // `run_setup_wizard` then writes with `toml::to_string_pretty`.
+        let wizard_settings = MostroSettings {
+            fee: 0.01,
+            fiat_currencies_accepted: vec!["USD".to_string()],
+            ..MostroSettings::default()
+        };
+        let written = toml::to_string_pretty(&wizard_settings).unwrap();
+        assert!(
+            written.contains("dev_fee_enabled = false"),
+            "wizard output must carry the disabled switch, got:\n{written}"
+        );
+        assert!(!written.contains("dev_fee_enabled = true"));
+
+        // The generated file loads back as disabled, with the percentage
+        // intact so startup validation still passes.
+        let reloaded: MostroSettings = toml::from_str(&written).unwrap();
+        assert!(!reloaded.dev_fee_enabled);
+        assert_eq!(reloaded.dev_fee_percentage, 0.30);
+        assert_eq!(reloaded.dev_fee_lightning_address, None);
     }
 
     #[test]
@@ -1086,7 +1166,9 @@ pub struct MostroSettings {
     /// Development fee as percentage of Mostro fee (0.10 to 1.0)
     /// Example: 0.30 means 30% of the Mostro fee goes to development
     pub dev_fee_percentage: f64,
-    /// Enable developer fee payments. Defaults to true for backward compatibility.
+    /// Enable developer fee payments. Defaults to false: a missing key
+    /// disables the fee, and the operator must set `dev_fee_enabled = true`
+    /// to opt in.
     #[serde(default = "default_dev_fee_enabled")]
     pub dev_fee_enabled: bool,
     /// Lightning address dev fees are paid to. Absent falls back to the
@@ -1231,7 +1313,7 @@ impl Default for MostroSettings {
             ],
             max_orders_per_response: 10,
             dev_fee_percentage: 0.30,
-            dev_fee_enabled: true,
+            dev_fee_enabled: false,
             dev_fee_lightning_address: None,
             name: None,
             about: None,

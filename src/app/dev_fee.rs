@@ -1456,7 +1456,7 @@ pub async fn send_dev_fee_payment(
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_stale_pending_markers, dev_fee_payments_enabled, handle_payment_failure,
+        cleanup_stale_pending_markers, dev_fee_payments_enabled_for, handle_payment_failure,
         handle_payment_success, parse_pending_timestamp, release_all_pending_claims,
         release_pending_claim, try_claim_order_for_dev_fee,
     };
@@ -2573,16 +2573,23 @@ mod tests {
         // The dev fund address only issues mainnet invoices: any other chain
         // would hit its LNURL server every cycle for a payment that can never
         // succeed (#1039).
+        //
+        // The fee is opted into explicitly: the node default is disabled, and
+        // the shared test settings must not decide this test's outcome.
+        let enabled = crate::config::types::MostroSettings {
+            dev_fee_enabled: true,
+            ..Default::default()
+        };
         let networks = |n: &str| vec![n.to_string()];
-        assert!(dev_fee_payments_enabled(&networks("mainnet")));
+        assert!(dev_fee_payments_enabled_for(&networks("mainnet"), &enabled));
         for n in ["regtest", "testnet", "testnet4", "signet", "simnet"] {
             assert!(
-                !dev_fee_payments_enabled(&networks(n)),
+                !dev_fee_payments_enabled_for(&networks(n), &enabled),
                 "{n} must not pay dev fees"
             );
         }
         // Unknown chain (no GetInfo data): fail closed.
-        assert!(!dev_fee_payments_enabled(&[]));
+        assert!(!dev_fee_payments_enabled_for(&[], &enabled));
     }
 
     #[tokio::test]
@@ -3272,6 +3279,25 @@ mod dev_fee_gate_tests {
             assert!(
                 !dev_fee_payments_enabled_for(&networks, &disabled_settings()),
                 "dev_fee_enabled = false must block payments for networks {networks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_settings_never_pay_dev_fees_even_on_mainnet() {
+        // Nothing opted in: the default node must not schedule a dev-fee
+        // payment on any network, including mainnet.
+        let defaults = MostroSettings::default();
+        assert!(!defaults.dev_fee_enabled);
+        for networks in [
+            vec!["mainnet".to_string()],
+            vec!["testnet".to_string()],
+            vec!["regtest".to_string()],
+            vec![],
+        ] {
+            assert!(
+                !dev_fee_payments_enabled_for(&networks, &defaults),
+                "default settings must not pay dev fees on {networks:?}"
             );
         }
     }

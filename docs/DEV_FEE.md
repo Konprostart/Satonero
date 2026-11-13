@@ -2,7 +2,7 @@
 
 ## Overview
 
-The development fee mechanism provides sustainable funding for Mostro development by automatically sending a configurable percentage of the Mostro fee to a lightning address set on `DEV_FEE_LIGHTNING_ADDRESS` on each successful order.
+The development fee mechanism is an **optional, opt-in** way to fund development: when an operator enables it (`dev_fee_enabled = true`), a configurable percentage of the Mostro fee is sent to a lightning address on each successful order (`dev_fee_lightning_address`, or the compiled-in `DEV_FEE_LIGHTNING_ADDRESS` fallback). It is **disabled by default**, and the rest of this document describes the behaviour once it has been enabled. The development fee is separate from the Mostro trade fee (`mostro.fee`) that parties pay for a trade.
 
 **Key Design Principles:**
 - Transparent and configurable
@@ -155,21 +155,65 @@ pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "<dev@lightning.address>";
 # Development sustainability fee
 # Percentage of Mostro fee sent to development fund (minimum 10%)
 dev_fee_percentage = 0.30
+# Opt-in switch: the fee is disabled unless this is true
+dev_fee_enabled = false
+# Optional: where an enabled fee is paid. When unset, the compiled-in
+# DEV_FEE_LIGHTNING_ADDRESS fallback is used, so set your own when you opt in.
+# dev_fee_lightning_address = 'you@your-node.example.com'
 ```
 
 **Validation Rules:**
-- Must be between 0.10 (10%) and 1.0 (100%)
-- Validated on daemon startup
+- `dev_fee_percentage` must be between 0.10 (10%) and 1.0 (100%)
+- Validated on daemon startup, **even when `dev_fee_enabled = false`**
 - Invalid values cause startup failure with error message
+
+### `dev_fee_enabled`
+
+The development fee is **opt-in**. `dev_fee_enabled` defaults to `false`, and a
+`settings.toml` that omits the key also has the fee disabled. An operator must
+deliberately set `dev_fee_enabled = true` to pay it. The default is defined in
+both places it can be read from, and both are `false`:
+
+- `default_dev_fee_enabled()` — the serde default for a file that omits the key
+  (`src/config/types.rs`);
+- `MostroSettings::default()` — used by the interactive setup wizard when it
+  writes a new `settings.toml` (`src/config/types.rs`, `src/config/wizard.rs`),
+  and by tests.
+
+The shipped `settings.tpl.toml` (used for the manual wizard option and for the
+file created on a first non-interactive start, e.g. Docker or systemd) also
+sets `dev_fee_enabled = false`.
+
+| `dev_fee_enabled` | Effect |
+|---|---|
+| `true` | Fee is calculated at take time, scheduled after settlement, paid on mainnet only, and audited with a kind 8383 event. |
+| `false` or key missing | `get_dev_fee` returns 0, so `orders.dev_fee` stays 0; the payment job is never started; no LNURL resolution, no payment, no audit event; the health event (kind 38389) carries no `dev_fee` content. |
+
+This switch is independent of the ordinary Mostro trade fee (`mostro.fee`),
+which is unchanged either way: the hold invoice amount and the Mostro fee
+charged to the parties are the same with the dev fee enabled or disabled. The
+development fee is a share (`dev_fee_percentage`) of the Mostro fee that the
+node itself pays out of its earnings, not an extra charge to users.
+
+Disabling the fee on a node that already has history does not delete or alter
+any row. Orders recorded earlier with `dev_fee > 0` and `dev_fee_paid = 0`
+stay as they are and are picked up again if the operator later sets
+`dev_fee_enabled = true` on a mainnet node. While disabled, a claim marker
+(`PENDING-…`) left by an interrupted run is released at startup, as on any
+node that does not pay dev fees. A dev fee whose payment hash was already
+recorded (a payment that reached LND) is not touched; it keeps counting as an
+in-flight dev fee in the node-identity guard until it is resolved.
 
 ### Default Values
 
-- `dev_fee_percentage`: 0.30 (30%)
+- `dev_fee_enabled`: `false` (opt-in; a missing key also means disabled)
+- `dev_fee_percentage`: 0.30 (30%), used only when the fee is enabled
 - Configured in `src/config/types.rs::MostroSettings::default()`
 
 ### Mainnet Only
 
-Dev fees are only paid when the connected LND reports `mainnet` in `GetInfo`.
+Dev fees are only paid when `dev_fee_enabled = true` **and** the connected LND
+reports `mainnet` in `GetInfo`.
 `DEV_FEE_LIGHTNING_ADDRESS` only issues mainnet invoices, so on regtest,
 testnet or signet (local Polar setups, E2E runs) the payment job is not
 started at all and the daemon logs once at startup:
@@ -178,8 +222,9 @@ started at all and the daemon logs once at startup:
 Lightning node is not on mainnet (networks: ["regtest"]); dev fee payments are disabled
 ```
 
-Dev fee amounts are still calculated and stored on orders as usual; they
-simply stay unpaid (`dev_fee_paid = 0`). Since no cycle runs there to clean
+With the fee enabled on such a network, dev fee amounts are still calculated
+and stored on orders as usual; they simply stay unpaid (`dev_fee_paid = 0`).
+With the fee disabled (the default) nothing is calculated or stored. Since no cycle runs there to clean
 them up, startup also releases any `PENDING-…` claim marker an interrupted
 run left behind (`release_all_pending_claims`), before the node-identity
 guard would count it as an in-flight dev fee. The gate lives in
@@ -1510,7 +1555,9 @@ cargo build --release
 3. **Update settings.toml:**
 ```toml
 [mostro]
-dev_fee_percentage = 0.30  # Add this line
+dev_fee_percentage = 0.30  # Required: validated at startup
+dev_fee_enabled = false    # Optional: false is also the default when the key is missing
+# dev_fee_enabled = true   # Only to opt in deliberately (also set dev_fee_lightning_address)
 ```
 
 4. **Restart daemon:**
