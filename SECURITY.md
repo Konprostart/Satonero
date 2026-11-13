@@ -4,7 +4,9 @@ Mostro is a Lightning Network peer-to-peer exchange built on Nostr. The daemon c
 
 ## Supported Versions
 
-Security fixes are developed against the `main` branch and released in the next published version. Only the latest release on [crates.io](https://crates.io/crates/mostro) and the current `main` branch receive security updates; older releases are not patched or backported.
+Security fixes are developed against the `main` branch and released in the next tagged release. Only the latest tagged release and the current `main` branch receive security updates; older releases are not patched or backported.
+
+This repository does not publish to crates.io. The `mostro` crate published on [crates.io](https://crates.io/crates/mostro) is maintained by the upstream MostroP2P project, not by this repository, and `Cargo.toml` sets `publish = false`. Releases from this repository are GitHub releases (binaries with a checksum manifest) and container images published to this repository's own GHCR namespace.
 
 Operators running a Mostro instance are expected to upgrade to the latest release to receive fixes.
 

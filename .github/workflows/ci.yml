@@ -81,3 +81,34 @@ jobs:
         run: cargo build --all-features
 
 
+
+  # Guard the two invariants that keep a Satonero release from publishing the
+  # upstream `mostro` crate: Cargo.toml must keep `publish = false`, and no
+  # workflow may invoke cargo's publish subcommand. Cheap and deterministic (no cargo, no
+  # network), so it runs on every push.
+  no-crates-publish:
+    name: No crates.io publication
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Guard
+        run: |
+          set -euo pipefail
+          if grep -rnE 'cargo[[:space:]]+publish' .github/workflows/; then
+            echo "::error::a workflow runs a crate publication; Satonero must not publish the upstream mostro crate"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          pkg = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]
+          if pkg.get("publish", None) is not False:
+              print("::error::Cargo.toml [package] must set publish = false")
+              sys.exit(1)
+          print("publish = false and no workflow runs a crate publication")
+          PY
