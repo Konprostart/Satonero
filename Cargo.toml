@@ -7,6 +7,11 @@ authors = ["Francisco Calderón <negrunch@grunch.dev>"]
 description = "Lightning Network peer-to-peer nostr platform"
 homepage = "https://mostro.network"
 repository = "https://github.com/MostroP2P/mostro"
+# The `mostro` crate on crates.io belongs to the upstream MostroP2P project.
+# Satonero is an independent distribution and must never publish it: `cargo
+# publish` is refused for this package. Releases are GitHub releases and
+# container images built from this repository.
+publish = false
 
 [[bin]]
 name = "mostrod"
