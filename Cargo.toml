@@ -106,3 +106,9 @@ nostr-sdk = { version = "0.45.1", features = ["local-relay"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.1"
+
+# Satonero: redirect the `mostro-core` dependency from the MostroP2P-owned
+# crates.io crate to the Satonero-owned fork (identical source, same crate
+# name `mostro-core` and version `0.17.3`). See satonero-core/FORK.md.
+[patch.crates-io]
+mostro-core = { git = "https://github.com/Konprostart/satonero-core.git", tag = "v0.17.3-satonero" }

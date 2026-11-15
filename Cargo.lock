@@ -2387,8 +2387,7 @@ dependencies = [
 [[package]]
 name = "mostro-core"
 version = "0.17.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ed819083bca9759941ff4910add142abbcb25245b651721c4d70a6fc2e8749f"
+source = "git+https://github.com/Konprostart/satonero-core.git?tag=v0.17.3-satonero#21ed1c9b2bac329dcd31287d017d6005116751f7"
 dependencies = [
  "bitcoin",
  "chrono",
