@@ -161,9 +161,9 @@ Key points:
 > enable it on mainnet, you **must** set
 > `dev_fee_lightning_address = 'you@your-node.example.com'` to your own
 > Satonero address. The compiled-in fallback in
-> `src/config/constants.rs` still points at the Mostro project's address
-> (`dev@pay.mostro.foundation`); leaving it unset while `dev_fee_enabled = true`
-> would fund Mostro, not Satonero.
+> `src/config/constants.rs` is a non-routable placeholder (`dev@satonero.example`)
+> because Satonero operates no dev-fee fund of its own; leaving it unset while
+> `dev_fee_enabled = true` makes payments fail closed instead of funding anyone.
 
 ### Cashu mode (no Lightning node)
 

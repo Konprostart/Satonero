@@ -130,10 +130,11 @@ pub fn dev_fee_payments_enabled_for(networks: &[String], mostro_settings: &Mostr
 
 /// The Lightning address dev fees are paid to.
 ///
-/// Falls back to [`DEV_FEE_LIGHTNING_ADDRESS`] (the inherited upstream
-/// fund) when the operator has not set `dev_fee_lightning_address` in the
-/// settings. Fees are only ever paid when `dev_fee_enabled` is true AND
-/// the node runs on mainnet — see [`dev_fee_payments_enabled_for`].
+/// Falls back to [`DEV_FEE_LIGHTNING_ADDRESS`] (a non-routable Satonero
+/// placeholder, since Satonero operates no dev-fee fund of its own) when
+/// the operator has not set `dev_fee_lightning_address` in the settings.
+/// Fees are only ever paid when `dev_fee_enabled` is true AND the node
+/// runs on mainnet — see [`dev_fee_payments_enabled_for`].
 pub fn dev_fee_lightning_address() -> String {
     dev_fee_lightning_address_for(Settings::get_mostro())
 }

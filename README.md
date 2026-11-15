@@ -677,7 +677,7 @@ bitcoin_price_api_url = "https://api.yadio.io"
 > dev_fee_lightning_address = 'you@your-node.example.com'
 > ```
 >
-> Without `dev_fee_lightning_address`, an enabled fee on mainnet is paid to the address compiled into the binary (`DEV_FEE_LIGHTNING_ADDRESS`, an upstream Mostro address), so set your own address when you opt in. Fees are only ever paid when the node is on mainnet. `dev_fee_percentage` must stay between 0.10 and 1.0 because the daemon validates it at startup even when `dev_fee_enabled = false`. Existing configuration files are not changed automatically.
+> Without `dev_fee_lightning_address`, an enabled fee on mainnet is paid to the address compiled into the binary (`DEV_FEE_LIGHTNING_ADDRESS`). Satonero ships a non-routable placeholder there (`dev@satonero.example`, because Satonero operates no dev-fee fund of its own), so set your own address when you opt in — otherwise the payment fails closed instead of funding anyone. Fees are only ever paid when the node is on mainnet. `dev_fee_percentage` must stay between 0.10 and 1.0 because the daemon validates it at startup even when `dev_fee_enabled = false`. Existing configuration files are not changed automatically.
 
 ---
 

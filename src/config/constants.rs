@@ -50,10 +50,16 @@ pub const MAX_BOND_CLTV_DELTA: u32 = 864;
 /// default) stops the load instead of loading silently.
 pub const MAX_REPUTATION_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
 
-/// Official Mostro development Lightning Address.
-/// Self-custodial and served from a domain the project controls, so the
-/// backend behind it can change without a mostrod release.
-pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "dev@pay.mostro.foundation";
+/// Satonero development Lightning address fallback.
+///
+/// Satonero (an independent Mostro fork) does not yet operate its own
+/// development fund, so this compiled-in fallback is deliberately a
+/// non-routable placeholder (RFC 2606 reserves the `.example` TLD) rather
+/// than a live address. An operator who enables `dev_fee_enabled = true` on
+/// mainnet MUST set `dev_fee_lightning_address` to a Lightning address they
+/// control; otherwise dev-fee payments fail closed (LNURL resolution of this
+/// placeholder always errors) instead of funding the upstream Mostro fund.
+pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "dev@satonero.example";
 
 /// Nostr event kind for dev fee payment audit events
 /// Kind 8383 is in the regular events range (1000-9999) per NIP-01
@@ -89,10 +95,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dev_fee_address_is_self_hosted() {
-        // The previous custodial address was suspended by its custodian
-        // without notice (#1037); dev fees must go to the self-custodial
-        // address on a domain the project controls.
-        assert_eq!(DEV_FEE_LIGHTNING_ADDRESS, "dev@pay.mostro.foundation");
+    fn dev_fee_fallback_is_a_non_routable_placeholder() {
+        // Satonero has no dev-fee fund of its own yet, so the compiled-in
+        // fallback must never route fees to the upstream Mostro fund. It is
+        // a reserved `.example` placeholder that fails closed until an
+        // operator sets their own `dev_fee_lightning_address`.
+        assert_eq!(DEV_FEE_LIGHTNING_ADDRESS, "dev@satonero.example");
+        assert!(DEV_FEE_LIGHTNING_ADDRESS.ends_with(".example"));
     }
 }

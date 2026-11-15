@@ -291,7 +291,7 @@ $(printf '\033[1;32m')==========================================================
         (OR enable [cashu] enabled = true to run WITHOUT an LND node)
       - [mostro] dev_fee_*      → MUST set your own dev_fee_lightning_address
                                   if you enable dev_fee on mainnet (the compiled-in
-                                  fallback still points at the Mostro address!)
+                                  fallback is a non-routable Satonero placeholder)
    2. (optional) read your npub from the logs after the first start:
         journalctl -u $SERVICE_NAME -n 50 --no-pager
    3. Start the service:

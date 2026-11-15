@@ -145,8 +145,12 @@ Order Creation → Fee Calculation → Hold Invoice → Seller Release → Buyer
 ```rust
 pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;  // 10% minimum
 pub const MAX_DEV_FEE_PERCENTAGE: f64 = 1.0;   // 100% maximum
-pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "<dev@lightning.address>";
+pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "dev@satonero.example";
 ```
+
+`DEV_FEE_LIGHTNING_ADDRESS` is a non-routable placeholder: Satonero operates no
+dev-fee fund of its own, so an operator must set `dev_fee_lightning_address`
+before enabling the fee on mainnet (otherwise payments fail closed).
 
 ### Settings (`~/.mostro/settings.toml`)
 
@@ -214,9 +218,9 @@ in-flight dev fee in the node-identity guard until it is resolved.
 
 Dev fees are only paid when `dev_fee_enabled = true` **and** the connected LND
 reports `mainnet` in `GetInfo`.
-`DEV_FEE_LIGHTNING_ADDRESS` only issues mainnet invoices, so on regtest,
-testnet or signet (local Polar setups, E2E runs) the payment job is not
-started at all and the daemon logs once at startup:
+The dev-fee fallback address is only meant for mainnet invoices, so on
+regtest, testnet or signet (local Polar setups, E2E runs) the payment job is
+not started at all and the daemon logs once at startup:
 
 ```text
 Lightning node is not on mainnet (networks: ["regtest"]); dev fee payments are disabled
