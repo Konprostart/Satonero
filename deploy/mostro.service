@@ -1,0 +1,18 @@
+[Unit]
+Description=Satonero daemon (mostrod)
+Documentation=https://github.com/Konprostart/Satonero
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mostro
+WorkingDirectory=/opt/mostro
+ExecStart=/usr/local/bin/mostrod -d /opt/mostro
+Restart=on-failure
+RestartSec=5
+# main() sets RUST_LOG itself (release: none,mostro=info). Leave it unset
+# unless you want more verbose logs (e.g. RUST_LOG=debug,mostro=info).
+
+[Install]
+WantedBy=multi-user.target
