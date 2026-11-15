@@ -289,9 +289,9 @@ $(printf '\033[1;32m')==========================================================
       - [nostr] relays          → your relay(s)
       - [lightning] lnd_*       → paths to the LND cert/macaroon and gRPC host
         (OR enable [cashu] enabled = true to run WITHOUT an LND node)
-      - [mostro] dev_fee_*      → MUST set your own dev_fee_lightning_address
-                                  if you enable dev_fee on mainnet (the compiled-in
-                                  fallback is a non-routable Satonero placeholder)
+      - [mostro] dev_fee_*      → optional: the compiled-in fallback already
+                                  points at Satonero's dev-fee address; set
+                                  dev_fee_lightning_address to route elsewhere
    2. (optional) read your npub from the logs after the first start:
         journalctl -u $SERVICE_NAME -n 50 --no-pager
    3. Start the service:

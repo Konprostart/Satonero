@@ -158,12 +158,10 @@ Key points:
 - **`[mostro].dev_fee_*`** — see the box below.
 
 > ⚠️ **Dev fee address.** `dev_fee_enabled` is `false` by default (good). If you
-> enable it on mainnet, you **must** set
-> `dev_fee_lightning_address = 'you@your-node.example.com'` to your own
-> Satonero address. The compiled-in fallback in
-> `src/config/constants.rs` is a non-routable placeholder (`dev@satonero.example`)
-> because Satonero operates no dev-fee fund of its own; leaving it unset while
-> `dev_fee_enabled = true` makes payments fail closed instead of funding anyone.
+> enable it on mainnet, dev fees are paid to the address compiled into the
+> binary (`Ironfind009@walletofsatoshi.com`, Satonero's own). Optionally set
+> `dev_fee_lightning_address = 'you@your-node.example.com'` to route them to a
+> different address you control.
 
 ### Cashu mode (no Lightning node)
 

@@ -52,14 +52,12 @@ pub const MAX_REPUTATION_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 /// Satonero development Lightning address fallback.
 ///
-/// Satonero (an independent Mostro fork) does not yet operate its own
-/// development fund, so this compiled-in fallback is deliberately a
-/// non-routable placeholder (RFC 2606 reserves the `.example` TLD) rather
-/// than a live address. An operator who enables `dev_fee_enabled = true` on
-/// mainnet MUST set `dev_fee_lightning_address` to a Lightning address they
-/// control; otherwise dev-fee payments fail closed (LNURL resolution of this
-/// placeholder always errors) instead of funding the upstream Mostro fund.
-pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "dev@satonero.example";
+/// Fees collected by the optional dev fee (`dev_fee_enabled = true` on
+/// mainnet) are paid to this Lightning address unless an operator overrides
+/// it with `dev_fee_lightning_address` in `settings.toml`. The address is
+/// Satonero's own, so an enabled fee funds Satonero development rather than
+/// the upstream Mostro fund.
+pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "Ironfind009@walletofsatoshi.com";
 
 /// Nostr event kind for dev fee payment audit events
 /// Kind 8383 is in the regular events range (1000-9999) per NIP-01
@@ -95,12 +93,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dev_fee_fallback_is_a_non_routable_placeholder() {
-        // Satonero has no dev-fee fund of its own yet, so the compiled-in
-        // fallback must never route fees to the upstream Mostro fund. It is
-        // a reserved `.example` placeholder that fails closed until an
-        // operator sets their own `dev_fee_lightning_address`.
-        assert_eq!(DEV_FEE_LIGHTNING_ADDRESS, "dev@satonero.example");
-        assert!(DEV_FEE_LIGHTNING_ADDRESS.ends_with(".example"));
+    fn dev_fee_fallback_is_the_satonero_address() {
+        // The compiled-in fallback must fund Satonero development, never the
+        // upstream Mostro fund. It is Satonero's own Lightning address, so an
+        // operator who enables `dev_fee_enabled = true` on mainnet without
+        // setting `dev_fee_lightning_address` routes the fee to Satonero.
+        assert_eq!(DEV_FEE_LIGHTNING_ADDRESS, "Ironfind009@walletofsatoshi.com");
+        assert!(DEV_FEE_LIGHTNING_ADDRESS.contains('@'));
     }
 }

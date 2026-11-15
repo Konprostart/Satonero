@@ -145,12 +145,13 @@ Order Creation → Fee Calculation → Hold Invoice → Seller Release → Buyer
 ```rust
 pub const MIN_DEV_FEE_PERCENTAGE: f64 = 0.10;  // 10% minimum
 pub const MAX_DEV_FEE_PERCENTAGE: f64 = 1.0;   // 100% maximum
-pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "dev@satonero.example";
+pub const DEV_FEE_LIGHTNING_ADDRESS: &str = "Ironfind009@walletofsatoshi.com";
 ```
 
-`DEV_FEE_LIGHTNING_ADDRESS` is a non-routable placeholder: Satonero operates no
-dev-fee fund of its own, so an operator must set `dev_fee_lightning_address`
-before enabling the fee on mainnet (otherwise payments fail closed).
+`DEV_FEE_LIGHTNING_ADDRESS` is Satonero's own development Lightning address
+(`Ironfind009@walletofsatoshi.com`). It is the fallback used when an operator
+enables the fee on mainnet without setting `dev_fee_lightning_address`; set the
+latter to route the fee to a different address you control.
 
 ### Settings (`~/.mostro/settings.toml`)
 
@@ -162,7 +163,7 @@ dev_fee_percentage = 0.30
 # Opt-in switch: the fee is disabled unless this is true
 dev_fee_enabled = false
 # Optional: where an enabled fee is paid. When unset, the compiled-in
-# DEV_FEE_LIGHTNING_ADDRESS fallback is used, so set your own when you opt in.
+# DEV_FEE_LIGHTNING_ADDRESS fallback (Satonero's address) is used.
 # dev_fee_lightning_address = 'you@your-node.example.com'
 ```
 
