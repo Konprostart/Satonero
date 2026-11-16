@@ -3,6 +3,7 @@
 Quick links to architecture and feature guides.
 
 - Architecture Overview: ARCHITECTURE.md
+- Multi-User Deployment Guide (public node vs your own VPS, Docker Compose stack): SATONERO_DEPLOYMENT_GUIDE.md
 - Startup & Configuration: STARTUP_AND_CONFIG.md (template keys are required; see notes on Rust Defaults)
 - Event Routing: EVENT_ROUTING.md
 - Lightning Operations: LIGHTNING_OPS.md (includes the runbook for migrating to a different Lightning node)
