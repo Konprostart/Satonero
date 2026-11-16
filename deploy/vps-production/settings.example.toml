@@ -1,0 +1,98 @@
+# Satonero daemon configuration — EXAMPLE.
+#
+# This is a trimmed, commented example for the Docker stack in this directory.
+# The full template with every key and its documentation lives at the repo root
+# as settings.tpl.toml. Copy this file to config/settings.toml and edit it.
+#
+# Paths below are INSIDE the container (the compose file mounts ./config at
+# /config). For a manual (non-Docker) install, use the real host paths instead
+# (e.g. /home/user/.lnd/tls.cert) and a plain sqlite path.
+
+[lightning]
+# LND TLS certificate (inside the container).
+lnd_cert_file = '/config/lnd/tls.cert'
+# LND admin macaroon — the daemon needs the ADMIN macaroon (it creates
+# hold-invoices, pays out and reads status); do not use a read-only one.
+lnd_macaroon_file = '/config/lnd/admin.macaroon'
+# LND gRPC endpoint. LND must be running BEFORE the daemon, or the daemon
+# exits at startup in Lightning mode.
+lnd_grpc_host = 'https://host.docker.internal:10009'   # LND on the same host
+# lnd_grpc_host = 'https://your-lnd-host:10009'          # LND on another host
+
+[nostr]
+# Node secret key (nsec). Precedence: env MOSTRO_NSEC_PRIVKEY > .env >
+# this file. Keep it secret and back it up off the server.
+nsec_privkey = 'nsec1...'
+# Relays the daemon publishes to and reads from. List your own relay first,
+# then 1–2 public ones for redundancy.
+relays = ['wss://relay.satonero.com', 'wss://relay.damus.io']
+
+[mostro]
+# NIP-01 kind-0 metadata (optional but recommended for your brand).
+name = "Satonero"
+about = "Independent Bitcoin/Lightning peer-to-peer marketplace"
+# picture = "https://satonero.com/satonero-avatar.png"
+# website = "https://satonero.com"
+
+# Trading fee paid by the users: 0 = no fee, 0.01 = 1%.
+fee = 0
+# Ceiling (sats) on the routing fee the node pays to the network.
+max_routing_fee = 0.002
+# Order amount ceiling (sats).
+max_order_amount = 1000000
+# Minimum payment amount (sats).
+min_payment_amount = 100
+# Order expiry (hours).
+expiration_hours = 24
+
+# Fiat currencies accepted for orders (ISO 4217). Balkan focus:
+# EUR, RSD (Serbian dinar), BAM (Bosnia and Herzegovina mark), HRK (Croatian
+# kuna; also accept EUR for Croatia). Add more (USD, ARS, CUP, …) as needed.
+# Currencies a price provider cannot quote still work at fixed price only.
+fiat_currencies_accepted = ['EUR', 'RSD', 'BAM', 'HRK', 'USD', 'ARS', 'CUP']
+
+# Anti-spam proof-of-work (leading zero bits). Raise for stricter gating.
+pow = 0
+# pow_first_contact = 16   # stricter PoW for first-contact events
+
+# Development fee. Disabled by default; when enabled it is paid to the
+# Satonero development address (or dev_fee_lightning_address below).
+dev_fee_percentage = 0.30
+dev_fee_enabled = false
+# dev_fee_lightning_address = 'you@your-node.com'
+
+[database]
+url = "sqlite:///config/mostro.db"
+
+# Cashu escrow mode — the no-LND alternative. Mutually exclusive with a
+# Lightning node. When enabled, the daemon escrows trades in 2-of-3 NUT-11
+# P2PK tokens instead of LND hold-invoices. Leave disabled to use LND.
+[cashu]
+enabled = false
+# Mints accepted for new orders. Empty [] accepts any mint with a public host.
+mint_urls = []
+# Seller-recovery locktime floor in days.
+escrow_locktime_days = 15
+
+[expiration]
+# Retention for relay events, in days.
+order_days = 30
+rating_days = 90
+dispute_days = 90
+fee_audit_days = 365
+dm_days = 30
+
+[rpc]
+# Admin gRPC. Leave disabled; if enabled, set auth_token and keep the port
+# bound to localhost or behind a VPN.
+enabled = false
+listen_address = "127.0.0.1"
+port = 50051
+# auth_token = ""
+
+[health]
+# Publish a kind-38389 health event; optionally encrypt detailed metrics to a
+# watchdog pubkey (hex or npub).
+enabled = true
+interval = 60
+watchdog_pubkey = ""

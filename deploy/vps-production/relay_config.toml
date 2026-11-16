@@ -1,0 +1,83 @@
+# nostr-rs-relay configuration, optimized for a dedicated Satonero/Mostro relay.
+#
+# This allowlists only the event kinds the Satonero daemon and mobile app
+# actually use, so the relay discards unrelated traffic and keeps its database
+# small. Add other kinds only if you also serve general Nostr clients.
+
+[info]
+# The public URL the relay advertises. Must match the domain in Caddyfile.
+relay_url = "wss://relay.satonero.com/"
+
+# Relay information shown to clients.
+name = "satonero-relay"
+description = "Dedicated Nostr relay for the Satonero peer-to-peer marketplace."
+
+# Administrative contact pubkey (your npub hex), optional but recommended.
+#pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+# Administrative contact URI, optional.
+#contact = "mailto:contact@example.com"
+
+[database]
+# SQLite (default) is sufficient; no Postgres needed.
+engine = "sqlite"
+
+# Directory for SQLite files. The compose file mounts it at ./config/relay/data
+# and overrides this with --db, so this line is informational when using the
+# provided docker-compose.yml.
+#data_directory = "."
+
+[network]
+# Bind inside the container; Caddy (on the same compose network) proxies to it.
+address = "0.0.0.0"
+port = 8080
+
+# If you put the relay behind Cloudflare or another proxy, set the header that
+# carries the real client IP for logging.
+#remote_ip_header = "x-forwarded-for"
+#remote_ip_header = "cf-connecting-ip"
+
+[options]
+# Reject events whose timestamp is too far in the future (30 minutes).
+reject_future_seconds = 1800
+
+[limits]
+# Rate-limit event creation for the server as a whole. Optional; recommended
+# if the relay is public. Start conservative and raise if honest traffic is
+# throttled.
+#messages_per_sec = 5
+
+# Limit client subscriptions (recommended to prevent abuse).
+#subscriptions_per_min = 10
+
+# Event kind allowlist: only the kinds Satonero/Mostro uses are persisted.
+#
+#   0     - NIP-01 metadata (node and user profiles)
+#   14    - NIP-44 protocol-v2 direct messages (the transport the daemon uses)
+#   8383  - dev-fee audit events
+#   30078 - NIP-33 exchange rates (parameterized replaceable)
+#   38383 - orders
+#   38384 - ratings
+#   38385 - node info
+#   38386 - disputes
+#   38389 - node health
+#
+# Add 4 (legacy NIP-04 DMs) only if you must serve older clients.
+event_kind_allowlist = [
+    0, 14, 8383, 30078, 38383, 38384, 38385, 38386, 38389,
+]
+
+[authorization]
+# Pubkeys allowed to publish. Leave empty (unset) to accept anyone; set to a
+# list of hex pubkeys to turn the relay into a write-whitelisted one.
+#pubkey_whitelist = [
+#  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+#]
+# Enable NIP-42 authentication.
+#nip42_auth = false
+# Send DMs (kind 4) only to their authenticated recipients.
+#nip42_dms = false
+
+[verified_users]
+# NIP-05 verification: "enabled", "passive", or "disabled".
+#mode = "disabled"

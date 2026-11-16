@@ -1,0 +1,69 @@
+# Satonero production stack: daemon + Nostr relay + Caddy (TLS/wss).
+#
+# Layout (relative to this file, deploy/vps-production/):
+#   config/settings.toml        <- copy from settings.example.toml, then edit
+#   config/lnd/tls.cert         <- LND TLS certificate
+#   config/lnd/admin.macaroon   <- LND admin macaroon
+#   config/relay/config.toml    <- copy from relay_config.toml
+#   config/relay/data/          <- relay SQLite database (created on first run)
+#   config/caddy/Caddyfile      <- copy from Caddyfile, then set your domain
+#
+# Quick start:
+#   mkdir -p config/lnd config/relay/data config/caddy
+#   cp settings.example.toml config/settings.toml && $EDITOR config/settings.toml
+#   cp relay_config.toml      config/relay/config.toml
+#   cp Caddyfile              config/caddy/Caddyfile && $EDITOR config/caddy/Caddyfile
+#   cp /path/to/lnd/tls.cert  config/lnd/tls.cert
+#   cp /path/to/lnd/data/chain/bitcoin/mainnet/admin.macaroon config/lnd/admin.macaroon
+#   docker compose up -d
+
+services:
+  satonero:
+    # Until a signed vX.Y.Z release exists (which publishes :latest to GHCR),
+    # build from the repository. The Dockerfile's default (last) stage is the
+    # production `runtime` stage: mostrod only, no diagnostic helper.
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    # image: ghcr.io/konprostart/satonero:latest   # uncomment once a release tag exists
+    container_name: satonero
+    restart: unless-stopped
+    volumes:
+      - ./config:/config
+    extra_hosts:
+      # Reach LND running on the host. Omit this if LND is on another machine
+      # and set lnd_grpc_host to that host in config/settings.toml.
+      - "host.docker.internal:host-gateway"
+    environment:
+      - RUST_LOG=info,mostro=info
+    depends_on:
+      - relay
+
+  relay:
+    image: scsibug/nostr-rs-relay
+    container_name: satonero-relay
+    restart: unless-stopped
+    volumes:
+      - ./config/relay/data:/usr/src/app/db:Z
+      - ./config/relay/config.toml:/usr/src/app/config.toml:ro,Z
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    container_name: satonero-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"    # HTTP/3
+    volumes:
+      - ./config/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - relay
+
+volumes:
+  caddy_data:
+  caddy_config:

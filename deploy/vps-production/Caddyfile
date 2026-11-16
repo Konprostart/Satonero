@@ -1,0 +1,12 @@
+# Caddy reverse proxy for the Satonero Nostr relay.
+#
+# Replace `relay.satonero.com` with YOUR relay domain. That domain must have an
+# A/AAAA record pointing at this VPS before `docker compose up`, so Caddy can
+# obtain a Let's Encrypt certificate and serve wss:// automatically.
+#
+# Caddy detects the WebSocket upgrade, so a plain reverse_proxy is enough to
+# turn the relay's internal ws://relay:8080 into public wss://relay.satonero.com.
+
+relay.satonero.com {
+    reverse_proxy relay:8080
+}
