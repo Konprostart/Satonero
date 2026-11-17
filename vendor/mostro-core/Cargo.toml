@@ -1,0 +1,70 @@
+[package]
+name = "mostro-core"
+version = "0.17.3"
+edition = "2021"
+license = "MIT"
+authors = ["Francisco Calderón <negrunch@grunch.dev>"]
+description = "Mostro Core library"
+homepage = "https://mostro.network"
+repository = "https://github.com/MostroP2P/mostro-core"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[package.metadata.release]
+# (Default: true) Set to false to prevent automatically running `cargo publish`.
+publish = false
+# (Default: true) Set to false to prevent automatically pushing commits and tags to the Git remote.
+push = true
+# (Default: true) Run `cargo test` before release? Highly recommended.
+verify = true
+# (Default: true) Create a Git tag for the release (e.g., v0.2.1)? You usually want this.
+tag = true
+# (Default: false) Sign the release commit with GPG?
+sign-commit = true
+# (Default: false) Sign the release tag with GPG?
+sign-tag = true
+# Use 'allow-branch' if you release from other branches. Check defaults if needed.
+allow-branch = ["main"]
+# Generate CHANGELOG.md before creating the release tag (only during actual release, not dry-run)
+pre-release-hook = [
+  "sh",
+  "-c",
+  "cargo fmt --all && cargo clippy --all-targets --all-features -- -D warnings && if [ -n \"${GITHUB_TOKEN:-}\" ]; then GITHUB_TOKEN=\"$GITHUB_TOKEN\" git cliff --unreleased --github-repo MostroP2P/mostro-core -o CHANGELOG.md --tag {{version}}; else git cliff --unreleased -o CHANGELOG.md --tag {{version}}; fi && if [ \"$DRY_RUN\" != \"true\" ]; then git diff --quiet CHANGELOG.md || { git add CHANGELOG.md && git commit -m \"Update CHANGELOG for version {{version}}\"; }; else echo \"DRY RUN: Skip git add and commit\"; fi",
+]
+
+[dependencies]
+chrono = "0.4.45"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+uuid = { version = "1.24.0", features = [
+  "v4",
+  "fast-rng",
+  "macro-diagnostics",
+  "serde",
+  "js",
+] }
+sqlx = { version = "0.9.0", features = [
+  "runtime-tokio",
+  "tls-rustls-ring",
+  "sqlite",
+  "macros",
+  "chrono",
+  "uuid",
+], optional = true }
+wasm-bindgen = { version = "0.2.127", optional = true }
+nostr-sdk = { version = "0.45.1" }
+nostr = { version = "0.45.1", default-features = false, features = ["nip44"] }
+bitcoin = "0.32.102"
+# Leading `::hkdf` in chat code avoids ambiguity with `nostr_sdk::prelude::hkdf`.
+hkdf = "0.13.0"
+sha2 = "0.11.0"
+secp256k1 = "0.30"
+
+[features]
+default = ["wasm"]
+wasm = ["dep:wasm-bindgen"]
+sqlx = ["dep:wasm-bindgen", "dep:sqlx"]
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }

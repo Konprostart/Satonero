@@ -26,7 +26,7 @@ pub use settings::{get_db_pool, get_mostro_keys, init_mostro_settings, Settings}
 pub use types::{
     AntiAbuseBondSettings, BondApplyTo, DatabaseSettings, ExpirationSettings, LightningSettings,
     MostroSettings, NostrSettings, ReputationExportSettings, ReputationImportSettings,
-    ReputationIssuer,
+    ReputationIssuer, TelegramSettings,
 };
 
 // Global variables for Mostro configuration, Nostr client, Lightning status, and database pool

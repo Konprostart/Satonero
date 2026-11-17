@@ -1,5 +1,7 @@
 /target
 .env
+# Local build tooling (e.g. a pinned protoc fetched for this environment)
+/.tools
 mostro.db*
 mostro.log
 lnurl-test-server/target

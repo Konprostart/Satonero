@@ -109,32 +109,36 @@ async fn job_flush_messages_queue(ctx: AppContext) {
     // Clone for closure owning with Arc
     let restore_session_msg_list = MESSAGE_QUEUES.queue_restore_session_msg.clone();
     let sender_keys = ctx.keys().clone();
+    let pool = ctx.pool_arc();
 
     // Helper function to send messages
     async fn send_messages(
         msg_list: Arc<RwLock<Vec<(Message, PublicKey)>>>,
-        sender_keys: Keys,
+        sender_keys: &Keys,
         retries: &mut usize,
-    ) {
-        if !msg_list.read().await.is_empty() {
-            let (message, destination_key) = msg_list.read().await[0].clone();
-            match message.as_json() {
-                Ok(msg) => {
-                    if let Err(e) = send_dm(destination_key, &sender_keys, &msg, None).await {
-                        error!("Failed to send message: {}", e);
-                        *retries += 1;
-                    } else {
-                        *retries = 0;
-                        msg_list.write().await.remove(0);
-                    }
-                }
-                Err(e) => error!("Failed to parse message: {}", e),
-            }
-            if *retries > 3 {
-                *retries = 0; // Reset retries after removing message
-                msg_list.write().await.remove(0);
-            }
+    ) -> Option<(Message, PublicKey)> {
+        if msg_list.read().await.is_empty() {
+            return None;
         }
+        let (message, destination_key) = msg_list.read().await[0].clone();
+        match message.as_json() {
+            Ok(msg) => {
+                if let Err(e) = send_dm(destination_key, sender_keys, &msg, None).await {
+                    error!("Failed to send message: {}", e);
+                    *retries += 1;
+                } else {
+                    *retries = 0;
+                    msg_list.write().await.remove(0);
+                    return Some((message, destination_key));
+                }
+            }
+            Err(e) => error!("Failed to parse message: {}", e),
+        }
+        if *retries > 3 {
+            *retries = 0; // Reset retries after removing message
+            msg_list.write().await.remove(0);
+        }
+        None
     }
 
     // Spawn a new task to flush the messages queue
@@ -144,21 +148,32 @@ async fn job_flush_messages_queue(ctx: AppContext) {
         let mut retries_restore_session_messages = 0;
 
         loop {
-            send_messages(
-                order_msg_list.clone(),
-                sender_keys.clone(),
-                &mut retries_messages,
-            )
-            .await;
+            if let Some((message, destination)) =
+                send_messages(order_msg_list.clone(), &sender_keys, &mut retries_messages).await
+            {
+                // Additional Telegram notification sink (v1, read-only):
+                // mirror the order-status transition to the recipient's linked
+                // chat. Best-effort — it never blocks or fails Nostr delivery,
+                // and it derives its text from the action only, never the
+                // payload (so no invoice / payer data can leak).
+                let kind = message.get_inner_message_kind();
+                crate::telegram::notify_order_message(
+                    pool.as_ref(),
+                    &destination,
+                    &kind.action,
+                    kind.id,
+                )
+                .await;
+            }
             send_messages(
                 cantdo_msg_list.clone(),
-                sender_keys.clone(),
+                &sender_keys,
                 &mut retries_cantdo_messages,
             )
             .await;
             send_messages(
                 restore_session_msg_list.clone(),
-                sender_keys.clone(),
+                &sender_keys,
                 &mut retries_restore_session_messages,
             )
             .await;

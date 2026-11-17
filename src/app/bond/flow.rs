@@ -3373,6 +3373,7 @@ mod tests {
             payer_history: None,
             health: Default::default(),
             reputation_export: None,
+            telegram: None,
         });
     }
 

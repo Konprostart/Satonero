@@ -2489,6 +2489,282 @@ impl RestoreSessionManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Telegram read-only notifications (v1): account linking.
+//
+// These queries are the persistence half of the Telegram feature. They are
+// deliberately read-only on the trade side: linking a chat can only notify,
+// never release/cancel/settle. The only mutation they perform is the linking
+// bookkeeping itself (`telegram_accounts`, `telegram_link_codes`).
+// ---------------------------------------------------------------------------
+
+/// A row from `telegram_accounts`: the Telegram chat linked to a Mostro
+/// identity.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TelegramAccount {
+    pub pubkey: String,
+    pub chat_id: i64,
+    pub linked_at: i64,
+}
+
+/// A row from `telegram_link_codes`: a one-time `/start <code>` code.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TelegramLinkCode {
+    pub code: String,
+    pub pubkey: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub used_at: Option<i64>,
+    pub chat_id: Option<i64>,
+}
+
+/// Minimum seconds that must elapse between mints of a *still-unused* code for
+/// the same identity. A client cannot flood the code table (or multiply the
+/// live-code brute-force surface) by hammering `RequestTelegramCode`; a
+/// legitimate re-link after the previous code was actually used is not
+/// throttled, because the gate only counts unused codes.
+const TELEGRAM_MIN_REMINT_SECS: i64 = 30;
+
+/// Mint a one-time linking code for `pubkey` and persist it. Returns the code
+/// in the clear (it is shown to the user once). `ttl_seconds` is how long it
+/// stays valid; `link_code_ttl_seconds` from `[telegram]` is the production
+/// value. The code is 12 mixed-case alphanumerics from the OS CSPRNG (≈71
+/// bits), single-use, and bound to the identity it was minted for.
+///
+/// Scale/security properties for many concurrent identities:
+///
+/// * **At most one outstanding code per identity** — minting a new code first
+///   deletes every previous unused code for that identity, so a re-mint always
+///   invalidates the old code and the live-code brute-force surface stays at
+///   one code per identity (not one per mint).
+/// * **Rate limited** — a mint is refused with
+///   [`CantDoReason::TooManyRequests`] while the identity still holds an
+///   unused code younger than [`TELEGRAM_MIN_REMINT_SECS`].
+/// * **Atomic** — the rate gate, the revocation and the insert share one
+///   transaction, so concurrent mints for the same identity cannot both pass
+///   the rate gate.
+pub async fn mint_telegram_link_code(
+    pool: &SqlitePool,
+    pubkey: String,
+    ttl_seconds: u64,
+) -> Result<String, MostroError> {
+    use rand::distributions::Alphanumeric;
+    use rand::Rng;
+
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = now.saturating_add(ttl_seconds as i64);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Rate gate: refuse while this identity still holds a recent unused code.
+    let newest_unused: Option<i64> = sqlx::query_scalar(
+        r#"
+            SELECT MAX(created_at)
+            FROM telegram_link_codes
+            WHERE pubkey = ?1 AND used_at IS NULL
+        "#,
+    )
+    .bind(&pubkey)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if let Some(newest) = newest_unused {
+        if now.saturating_sub(newest) < TELEGRAM_MIN_REMINT_SECS {
+            tx.rollback()
+                .await
+                .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+            return Err(MostroCantDo(CantDoReason::TooManyRequests));
+        }
+    }
+
+    // Invalidate every previous unused code so exactly one stays outstanding.
+    sqlx::query("DELETE FROM telegram_link_codes WHERE pubkey = ?1 AND used_at IS NULL")
+        .bind(&pubkey)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // A duplicate of a 71-bit code is astronomically unlikely; still, loop a
+    // handful of times so the UNIQUE constraint can never surface as a
+    // user-facing error.
+    for _ in 0..5 {
+        let code: String = rand::thread_rng()
+            .sample_iter(Alphanumeric)
+            .take(12)
+            .map(|byte| byte as char)
+            .collect();
+
+        let inserted = sqlx::query(
+            r#"
+                INSERT INTO telegram_link_codes (code, pubkey, created_at, expires_at)
+                VALUES (?1, ?2, ?3, ?4)
+            "#,
+        )
+        .bind(&code)
+        .bind(&pubkey)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await;
+
+        match inserted {
+            Ok(_) => {
+                tx.commit()
+                    .await
+                    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+                return Ok(code);
+            }
+            // Collision on the primary key: mint another code.
+            Err(e)
+                if e.as_database_error()
+                    .is_some_and(|db| db.is_unique_violation()) =>
+            {
+                continue
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(MostroInternalErr(ServiceError::DbAccessError(
+                    e.to_string(),
+                )));
+            }
+        }
+    }
+
+    let _ = tx.rollback().await;
+    Err(MostroInternalErr(ServiceError::DbAccessError(
+        "could not mint a unique telegram link code".to_string(),
+    )))
+}
+
+/// Look up a one-time linking code by its code text. Returns `Ok(None)` when
+/// the code does not exist; the caller decides whether an expired or already
+/// used code is still worth reading.
+pub async fn find_telegram_link_code(
+    pool: &SqlitePool,
+    code: &str,
+) -> Result<Option<TelegramLinkCode>, MostroError> {
+    sqlx::query_as::<_, TelegramLinkCode>(
+        r#"
+            SELECT code, pubkey, created_at, expires_at, used_at, chat_id
+            FROM telegram_link_codes
+            WHERE code = ?1
+        "#,
+    )
+    .bind(code)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Activate a one-time linking code from `chat_id`: atomically mark the code
+/// used (only if it is still unused and unexpired) and (re)link the chat to
+/// the code's identity. The previous owner of `chat_id`, if any, is unlinked
+/// first so a single Telegram chat maps to exactly one identity.
+///
+/// Returns `Ok(Some(pubkey))` on success and `Ok(None)` when the code is
+/// unknown, already used, or expired. All steps share one transaction so a
+/// used code can never link and a successful link is never left half-written.
+pub async fn activate_telegram_link_code(
+    pool: &SqlitePool,
+    code: &str,
+    chat_id: i64,
+) -> Result<Option<String>, MostroError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    let now = chrono::Utc::now().timestamp();
+    let claimed = sqlx::query(
+        r#"
+            UPDATE telegram_link_codes
+            SET used_at = ?1, chat_id = ?2
+            WHERE code = ?3 AND used_at IS NULL AND expires_at >= ?1
+        "#,
+    )
+    .bind(now)
+    .bind(chat_id)
+    .bind(code)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    if claimed.rows_affected() == 0 {
+        // Unknown, expired or already used: leave every table untouched.
+        tx.rollback()
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+        return Ok(None);
+    }
+
+    let pubkey: String =
+        sqlx::query_scalar("SELECT pubkey FROM telegram_link_codes WHERE code = ?1")
+            .bind(code)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    // Unlink the previous identity bound to this chat (if any), then bind the
+    // new one. The chat_id UNIQUE constraint is satisfied by the delete first.
+    sqlx::query("DELETE FROM telegram_accounts WHERE chat_id = ?1")
+        .bind(chat_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    sqlx::query(
+        r#"
+            INSERT INTO telegram_accounts (pubkey, chat_id, linked_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(pubkey) DO UPDATE SET chat_id = excluded.chat_id, linked_at = excluded.linked_at
+        "#,
+    )
+    .bind(&pubkey)
+    .bind(chat_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+
+    Ok(Some(pubkey))
+}
+
+/// The Telegram chat linked to `pubkey`, if any. This is the lookup the
+/// notification sink performs on every order transition.
+pub async fn find_telegram_chat_id(
+    pool: &SqlitePool,
+    pubkey: &str,
+) -> Result<Option<i64>, MostroError> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+            SELECT chat_id FROM telegram_accounts WHERE pubkey = ?1
+        "#,
+    )
+    .bind(pubkey)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
+/// Unlink `pubkey` from its Telegram chat (used by revoke/replace flows and
+/// tests). Returns `true` when a row was removed.
+pub async fn revoke_telegram_link(pool: &SqlitePool, pubkey: &str) -> Result<bool, MostroError> {
+    let result = sqlx::query("DELETE FROM telegram_accounts WHERE pubkey = ?1")
+        .bind(pubkey)
+        .execute(pool)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
+    Ok(result.rows_affected() > 0)
+}
+
 // Add this cfg attribute if the code is *only* for testing
 #[cfg(test)]
 mod tests {

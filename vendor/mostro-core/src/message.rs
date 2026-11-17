@@ -1,0 +1,2932 @@
+//! Protocol message envelope exchanged between clients and a Mostro node.
+//!
+//! The top-level type is [`Message`], a tagged union that carries a
+//! [`MessageKind`] together with a discriminator (order, dispute, DM, rate,
+//! can't-do, restore). [`MessageKind`] holds the shared fields present on
+//! every request/response: protocol version, optional identifier, trade
+//! index, [`Action`] and [`Payload`].
+//!
+//! In transit, messages are serialized to JSON, optionally signed with the
+//! sender's trade keys using [`Message::sign`], and wrapped in a NIP-44
+//! direct event by [`crate::transport::wrap_message_with`].
+
+use crate::prelude::*;
+use bitcoin::hashes::sha256::Hash as Sha256Hash;
+use bitcoin::hashes::Hash;
+use nostr_sdk::prelude::*;
+use secp256k1::schnorr;
+use secp256k1::Secp256k1;
+#[cfg(feature = "sqlx")]
+use sqlx::FromRow;
+
+use std::fmt;
+use uuid::Uuid;
+
+/// Identity of a counterpart in a trade.
+///
+/// `Peer` bundles the counterpart's trade public key with an optional
+/// [`UserInfo`] snapshot so it can be embedded into messages that need to
+/// surface reputation (for example the peer disclosure sent with
+/// [`Action::FiatSentOk`]).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Peer {
+    /// Trade public key of the peer (hex or npub).
+    pub pubkey: String,
+    /// Optional reputation snapshot. Absent when the peer operates in full
+    /// privacy mode.
+    pub reputation: Option<UserInfo>,
+}
+
+impl Peer {
+    /// Create a new [`Peer`].
+    pub fn new(pubkey: String, reputation: Option<UserInfo>) -> Self {
+        Self { pubkey, reputation }
+    }
+
+    /// Parse a [`Peer`] from its JSON representation.
+    pub fn from_json(json: &str) -> Result<Self, ServiceError> {
+        serde_json::from_str(json).map_err(|_| ServiceError::MessageSerializationError)
+    }
+
+    /// Serialize the peer to a JSON string.
+    pub fn as_json(&self) -> Result<String, ServiceError> {
+        serde_json::to_string(&self).map_err(|_| ServiceError::MessageSerializationError)
+    }
+}
+
+/// Discriminator describing the verb of a Mostro message.
+///
+/// `Action` values are serialized in `kebab-case`. Each action has its own
+/// expected [`Payload`] shape — see [`MessageKind::verify`] for the full
+/// matrix.
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub enum Action {
+    /// Publish a new order. Payload: [`Payload::Order`].
+    NewOrder,
+    /// Take an existing `sell` order. Payload: optional
+    /// [`Payload::PaymentRequest`] or [`Payload::Amount`].
+    TakeSell,
+    /// Take an existing `buy` order. Payload: optional [`Payload::Amount`].
+    TakeBuy,
+    /// Request the taker to pay a Lightning invoice.
+    /// Payload: [`Payload::PaymentRequest`].
+    PayInvoice,
+    /// Mostro delivers the bolt11 hold invoice that the taker must pay as
+    /// their anti-abuse bond. Same payload shape and direction as
+    /// [`Action::PayInvoice`] (Mostro → user); only the discriminator
+    /// differs so clients can tell the bond invoice apart from the trade
+    /// hold invoice that follows.
+    /// Payload: [`Payload::PaymentRequest`].
+    PayBondInvoice,
+    /// Buyer notifies Mostro that fiat was sent.
+    FiatSent,
+    /// Mostro acknowledges the fiat-sent notification to the seller.
+    FiatSentOk,
+    /// Seller releases the hold invoice funds.
+    Release,
+    /// Mostro confirms that the funds have been released.
+    Released,
+    /// Cancel an order.
+    Cancel,
+    /// Mostro confirms that the order was canceled.
+    Canceled,
+    /// Local side started a cooperative cancel.
+    CooperativeCancelInitiatedByYou,
+    /// Remote side started a cooperative cancel.
+    CooperativeCancelInitiatedByPeer,
+    /// Local side opened a dispute.
+    DisputeInitiatedByYou,
+    /// Remote side opened a dispute.
+    DisputeInitiatedByPeer,
+    /// Both sides agreed on the cooperative cancel.
+    CooperativeCancelAccepted,
+    /// Mostro accepted the buyer's payout invoice.
+    BuyerInvoiceAccepted,
+    /// Mostro accepted the winning counterparty's bond-payout invoice.
+    /// Bond dual of [`Action::BuyerInvoiceAccepted`] (Mostro → winner):
+    /// the payout bolt11 was received and the payment is now pending, so
+    /// the client can stop prompting the user for an invoice.
+    /// Payload: [`Payload::Order`] (amount = counterparty share).
+    BondInvoiceAccepted,
+    /// Trade completed successfully.
+    PurchaseCompleted,
+    /// Mostro paid out a slashed bond's counterparty share successfully.
+    /// Bond dual of [`Action::PurchaseCompleted`] (Mostro → winner): the
+    /// `send_payment` to the winner's bolt11 succeeded and the bond is
+    /// now settled, so the client can close the claim.
+    /// Payload: [`Payload::Order`] (amount = counterparty share).
+    BondPayoutCompleted,
+    /// Mostro notifies a user that their anti-abuse bond was slashed for
+    /// letting a waiting-state timeout elapse (Mostro → slashed user). The
+    /// bond's hold invoice has been settled and the row moved to
+    /// `pending-payout`; the user keeps no claim over the forfeited sats.
+    /// Informational only — the slashed user receives this alongside the
+    /// `Action::Canceled` for the order itself.
+    /// Payload: [`Payload::Order`] (amount = slashed bond amount).
+    BondSlashed,
+    /// Mostro saw the hold-invoice payment accepted by the node.
+    HoldInvoicePaymentAccepted,
+    /// Mostro saw the hold-invoice payment settled.
+    HoldInvoicePaymentSettled,
+    /// Mostro saw the hold-invoice payment canceled.
+    HoldInvoicePaymentCanceled,
+    /// Informational: waiting for the seller to pay the hold invoice.
+    WaitingSellerToPay,
+    /// Informational: waiting for the buyer's payout invoice.
+    WaitingBuyerInvoice,
+    /// Buyer sends/updates its payout invoice.
+    /// Payload: [`Payload::PaymentRequest`].
+    AddInvoice,
+    /// Taker sends a Lightning invoice that Mostro must pay out as the
+    /// taker's anti-abuse bond. Same payload shape and direction as
+    /// [`Action::AddInvoice`] (user → Mostro); only the discriminator
+    /// differs so Mostro can tell a bond-payout invoice apart from a
+    /// buyer's trade payout invoice.
+    /// Payload: [`Payload::PaymentRequest`].
+    AddBondInvoice,
+    /// Informational: a buyer has taken a sell order.
+    BuyerTookOrder,
+    /// Server-initiated rating request.
+    Rate,
+    /// Client-initiated rate. Payload: [`Payload::RatingUser`].
+    RateUser,
+    /// Acknowledgement of a received rating.
+    RateReceived,
+    /// Mostro returns a structured refusal. Payload: [`Payload::CantDo`].
+    CantDo,
+    /// Client-initiated dispute.
+    Dispute,
+    /// Admin cancels a trade.
+    AdminCancel,
+    /// Admin cancel acknowledged.
+    AdminCanceled,
+    /// Admin settles the hold invoice.
+    AdminSettle,
+    /// Admin settle acknowledged.
+    AdminSettled,
+    /// Admin registers a new dispute solver.
+    AdminAddSolver,
+    /// Solver takes a dispute.
+    AdminTakeDispute,
+    /// Solver took the dispute acknowledged.
+    AdminTookDispute,
+    /// Notification that a Lightning payment failed.
+    /// Payload: [`Payload::PaymentFailed`].
+    PaymentFailed,
+    /// Invoice associated with the order was updated.
+    InvoiceUpdated,
+    /// Direct message between users. Payload: [`Payload::TextMessage`].
+    SendDm,
+    /// Disclosure of a counterpart's trade pubkey. Payload: [`Payload::Peer`].
+    TradePubkey,
+    /// Client asks Mostro to restore its session state. Payload must be `None`.
+    RestoreSession,
+    /// Client asks Mostro for its last known trade index. Payload must be
+    /// `None`.
+    LastTradeIndex,
+    /// Client reads the reputation this node holds for its own identity key.
+    /// Sent in the `restore` wrapper, requires the identity proof and carries
+    /// no `id`. Request payload: `None`. Response payload:
+    /// [`Payload::UserInfo`] (zeros and no `since` for an unknown identity).
+    UserInfo,
+    /// Listing of orders in response to a query.
+    /// Payload: [`Payload::Ids`] or [`Payload::Orders`].
+    Orders,
+    /// Seller submits a Cashu 2-of-3 multisig locked token as the trade
+    /// escrow, in place of paying a Lightning hold invoice (Cashu escrow
+    /// mode). Direction: seller → Mostro.
+    /// Payload: [`Payload::CashuLockProof`].
+    AddCashuEscrow,
+    /// Mostro confirms it validated the seller's Cashu escrow token (the
+    /// 2-of-3 condition is well-formed and the proofs are unspent at the
+    /// mint) and the trade can proceed. Informational; the daemon never
+    /// takes custody. Direction: Mostro → buyer/seller.
+    CashuEscrowLocked,
+    /// Mostro hands its `P_M` signatures (one per escrowed proof) to the
+    /// dispute winner so they can assemble a valid 2-of-3 swap at the mint.
+    /// Emitted only during dispute resolution, as the Cashu counterpart of
+    /// [`Action::AdminSettled`] / [`Action::AdminCanceled`].
+    /// Direction: Mostro → winner. Payload: [`Payload::CashuSignatures`].
+    CashuPmSignature,
+    /// Buyer commits to the fiat account it will pay from, by hash only.
+    /// Direction: buyer → Mostro. Payload: [`Payload::PayerDeclaration`].
+    DeclarePayer,
+    /// The committed payer hash: Mostro's ack to the buyer and its forward
+    /// to the seller. Direction: Mostro → buyer/seller.
+    /// Payload: [`Payload::PayerDeclaration`].
+    PayerDeclared,
+    /// Aggregate history of the buyer's committed payment account.
+    /// Seller → Mostro query (payload `None`); Mostro → seller push after
+    /// `fiat-sent-ok` or reply to the query (payload
+    /// [`Payload::PaymentHistory`]).
+    PaymentHistory,
+    /// User asks the node to attest their reputation there for a destination
+    /// identity. Acts on the identity the transport proved, never on the
+    /// payload, and requires that identity proof. Carries no `id`.
+    /// Direction: client → issuer. Payload: [`Payload::ReputationExportRequest`].
+    ExportReputation,
+    /// The node's reputation attestation, in reply to
+    /// [`Action::ExportReputation`]. Direction: issuer → client.
+    /// Payload: [`Payload::ReputationAttestation`].
+    ReputationExported,
+    /// User imports a reputation attestation into the node. Requires the
+    /// identity proof; carries no `id`. Direction: client → destination.
+    /// Payload: [`Payload::ReputationAttestation`].
+    ImportReputation,
+    /// The import was recorded and merged, in reply to
+    /// [`Action::ImportReputation`]. Direction: destination → client.
+    /// Payload must be `None`.
+    ReputationImported,
+    /// User asks the node for a one-time Telegram linking code, which they
+    /// then activate by sending `/start <code>` to the node's Telegram bot.
+    /// Direction: client → node. Payload must be `None`. The node replies
+    /// with [`Action::TelegramCode`] carrying the code.
+    RequestTelegramCode,
+    /// The node hands back a one-time Telegram linking code in reply to
+    /// [`Action::RequestTelegramCode`]. Direction: node → client.
+    /// Payload: [`Payload::TextMessage`] (the code).
+    TelegramCode,
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+/// Top-level Mostro message exchanged between users and Mostro.
+///
+/// `Message` is a tagged union: every variant carries the shared
+/// [`MessageKind`] body, while the variant itself tells the receiver which
+/// channel the message belongs to (orders, disputes, DMs, rating, can't-do,
+/// session restore). Serializes as `kebab-case` JSON.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Message {
+    /// Order-channel message.
+    Order(MessageKind),
+    /// Dispute-channel message.
+    Dispute(MessageKind),
+    /// "Can't do" response returned by the Mostro node.
+    CantDo(MessageKind),
+    /// Rating message (server-initiated rate request or client rate).
+    Rate(MessageKind),
+    /// Direct message between users.
+    Dm(MessageKind),
+    /// Session restore request/response.
+    Restore(MessageKind),
+}
+
+impl Message {
+    /// Build a new `Message::Order` wrapping a freshly constructed
+    /// [`MessageKind`].
+    pub fn new_order(
+        id: Option<Uuid>,
+        request_id: Option<u64>,
+        trade_index: Option<i64>,
+        action: Action,
+        payload: Option<Payload>,
+    ) -> Self {
+        let kind = MessageKind::new(id, request_id, trade_index, action, payload);
+        Self::Order(kind)
+    }
+
+    /// Build a new `Message::Dispute` wrapping a freshly constructed
+    /// [`MessageKind`].
+    pub fn new_dispute(
+        id: Option<Uuid>,
+        request_id: Option<u64>,
+        trade_index: Option<i64>,
+        action: Action,
+        payload: Option<Payload>,
+    ) -> Self {
+        let kind = MessageKind::new(id, request_id, trade_index, action, payload);
+
+        Self::Dispute(kind)
+    }
+
+    /// Build a new `Message::Restore` with [`Action::RestoreSession`].
+    ///
+    /// According to [`MessageKind::verify`], the payload for a restore
+    /// request must be `None`. Any other payload yields an invalid message.
+    pub fn new_restore(payload: Option<Payload>) -> Self {
+        let kind = MessageKind::new(None, None, None, Action::RestoreSession, payload);
+        Self::Restore(kind)
+    }
+
+    /// Build a new `Message::CantDo` message (a structured refusal sent by
+    /// Mostro when a request cannot be fulfilled).
+    pub fn cant_do(id: Option<Uuid>, request_id: Option<u64>, payload: Option<Payload>) -> Self {
+        let kind = MessageKind::new(id, request_id, None, Action::CantDo, payload);
+
+        Self::CantDo(kind)
+    }
+
+    /// Build a new `Message::Dm` carrying a direct message between users.
+    pub fn new_dm(
+        id: Option<Uuid>,
+        request_id: Option<u64>,
+        action: Action,
+        payload: Option<Payload>,
+    ) -> Self {
+        let kind = MessageKind::new(id, request_id, None, action, payload);
+
+        Self::Dm(kind)
+    }
+
+    /// Parse a [`Message`] from its JSON representation.
+    pub fn from_json(json: &str) -> Result<Self, ServiceError> {
+        serde_json::from_str(json).map_err(|_| ServiceError::MessageSerializationError)
+    }
+
+    /// Serialize the message to a JSON string.
+    pub fn as_json(&self) -> Result<String, ServiceError> {
+        serde_json::to_string(&self).map_err(|_| ServiceError::MessageSerializationError)
+    }
+
+    /// Borrow the inner [`MessageKind`] regardless of the variant.
+    pub fn get_inner_message_kind(&self) -> &MessageKind {
+        match self {
+            Message::Dispute(k)
+            | Message::Order(k)
+            | Message::CantDo(k)
+            | Message::Rate(k)
+            | Message::Dm(k)
+            | Message::Restore(k) => k,
+        }
+    }
+
+    /// Return the [`Action`] of the inner [`MessageKind`].
+    ///
+    /// Always returns `Some` for the current variant set; the `Option` is
+    /// kept for API stability.
+    pub fn inner_action(&self) -> Option<Action> {
+        match self {
+            Message::Dispute(a)
+            | Message::Order(a)
+            | Message::CantDo(a)
+            | Message::Rate(a)
+            | Message::Dm(a)
+            | Message::Restore(a) => Some(a.get_action()),
+        }
+    }
+
+    /// Validate that the inner [`MessageKind`] is consistent with its
+    /// [`Action`]. Delegates to [`MessageKind::verify`], and rejects
+    /// [`Action::UserInfo`] outside the `restore` wrapper.
+    pub fn verify(&self) -> bool {
+        if !matches!(self, Message::Restore(_))
+            && self.get_inner_message_kind().action == Action::UserInfo
+        {
+            return false;
+        }
+        match self {
+            Message::Order(m)
+            | Message::Dispute(m)
+            | Message::CantDo(m)
+            | Message::Rate(m)
+            | Message::Dm(m)
+            | Message::Restore(m) => m.verify(),
+        }
+    }
+
+    /// Produce a Schnorr signature over the SHA-256 digest of `message`
+    /// using `keys`.
+    ///
+    /// This is the trade signature embedded in the content tuple when
+    /// [`crate::transport::wrap_message_nip44`] is called with
+    /// [`WrapOptions::signed`](crate::transport::WrapOptions::signed) set to
+    /// `true`. It binds a message to the sender's trade keys without
+    /// relying on the outer Nostr event signature.
+    ///
+    /// Implementation note (nostr 0.45): `Keys::sign_schnorr` takes the
+    /// digest as raw bytes (`AsRef<[u8]>`), not `bitcoin::secp256k1::Message`.
+    pub fn sign(message: String, keys: &Keys) -> Signature {
+        let hash: Sha256Hash = Sha256Hash::hash(message.as_bytes());
+        keys.sign_schnorr(hash.to_byte_array())
+    }
+
+    /// Verify a signature previously produced by [`Message::sign`].
+    ///
+    /// Returns `true` when `sig` is a valid Schnorr signature of the
+    /// SHA-256 digest of `message` under `pubkey`, `false` otherwise
+    /// (including when `pubkey` has no x-only representation).
+    ///
+    /// Uses the same `secp256k1` 0.30 types as `nostr` (via the crate's
+    /// direct `secp256k1` dependency) so verification stays aligned with
+    /// [`Message::sign`].
+    pub fn verify_signature(message: String, pubkey: PublicKey, sig: Signature) -> bool {
+        let hash: Sha256Hash = Sha256Hash::hash(message.as_bytes());
+        let hash = hash.to_byte_array();
+
+        let secp = Secp256k1::verification_only();
+        if let Ok(xonlykey) = pubkey.xonly() {
+            let sig = schnorr::Signature::from_byte_array(*sig.as_bytes());
+            xonlykey.verify(&secp, &hash, &sig).is_ok()
+        } else {
+            false
+        }
+    }
+}
+
+/// Body shared by every [`Message`] variant.
+///
+/// All Mostro protocol messages share this envelope: a protocol version,
+/// an optional client-chosen request id for correlation, a trade index used
+/// to enforce strictly increasing sequences per user, an optional
+/// order/dispute id, an [`Action`] and an optional [`Payload`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessageKind {
+    /// Mostro protocol version. Set to
+    /// `PROTOCOL_VER` by [`MessageKind::new`].
+    pub version: u8,
+    /// Client-chosen correlation id, echoed back on responses so the client
+    /// can match them to in-flight requests.
+    pub request_id: Option<u64>,
+    /// Trade index attached to this message. Must be strictly greater than
+    /// the last trade index Mostro has seen for the sender.
+    pub trade_index: Option<i64>,
+    /// Optional target identifier (usually the id of an [`crate::order::Order`]
+    /// or [`crate::dispute::Dispute`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<Uuid>,
+    /// Verb of the message.
+    pub action: Action,
+    /// Payload attached to the action. The allowed shape for a given action
+    /// is enforced by [`MessageKind::verify`].
+    pub payload: Option<Payload>,
+}
+
+/// Alias for a signed integer amount in satoshis.
+type Amount = i64;
+
+/// Retry configuration for a failed Lightning payment.
+///
+/// Sent inside a [`Payload::PaymentFailed`] so the client knows how many
+/// retries to expect and how long to wait between them.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PaymentFailedInfo {
+    /// Maximum number of payment attempts Mostro will perform.
+    pub payment_attempts: u32,
+    /// Delay in seconds between two retry attempts.
+    pub payment_retries_interval: u32,
+}
+
+/// Row-mapper used by `mostrod` when fetching metadata for session restore.
+///
+/// Not intended as a general-purpose order representation — field names are
+/// chosen to match the SQL `SELECT` aliases used by the server query.
+#[cfg_attr(feature = "sqlx", derive(FromRow))]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RestoredOrderHelper {
+    /// Order id.
+    pub id: Uuid,
+    /// Order status, serialized as kebab-case.
+    pub status: String,
+    /// Master identity pubkey of the buyer, if any.
+    pub master_buyer_pubkey: Option<String>,
+    /// Master identity pubkey of the seller, if any.
+    pub master_seller_pubkey: Option<String>,
+    /// Trade index the buyer used on this order.
+    pub trade_index_buyer: Option<i64>,
+    /// Trade index the seller used on this order.
+    pub trade_index_seller: Option<i64>,
+}
+
+/// Row-mapper used by `mostrod` when fetching disputes for session restore.
+///
+/// Field names are chosen to match the SQL `SELECT` aliases in the restore
+/// query (in particular `status` is aliased as `dispute_status`).
+#[cfg_attr(feature = "sqlx", derive(FromRow))]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RestoredDisputeHelper {
+    /// Dispute id.
+    pub dispute_id: Uuid,
+    /// Order id the dispute is attached to.
+    pub order_id: Uuid,
+    /// Dispute status, serialized as kebab-case.
+    pub dispute_status: String,
+    /// Master identity pubkey of the buyer, if any.
+    pub master_buyer_pubkey: Option<String>,
+    /// Master identity pubkey of the seller, if any.
+    pub master_seller_pubkey: Option<String>,
+    /// Trade index the buyer used on the parent order.
+    pub trade_index_buyer: Option<i64>,
+    /// Trade index the seller used on the parent order.
+    pub trade_index_seller: Option<i64>,
+    /// Whether the buyer has initiated a dispute for this order.
+    /// Combined with [`Self::seller_dispute`] to derive
+    /// [`RestoredDisputesInfo::initiator`].
+    pub buyer_dispute: bool,
+    /// Whether the seller has initiated a dispute for this order.
+    /// Combined with [`Self::buyer_dispute`] to derive
+    /// [`RestoredDisputesInfo::initiator`].
+    pub seller_dispute: bool,
+    /// Public key of the solver assigned to the dispute, `None` if no
+    /// solver has taken it.
+    pub solver_pubkey: Option<String>,
+}
+
+/// Minimal per-order information returned to a client on session restore.
+#[cfg_attr(feature = "sqlx", derive(FromRow))]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RestoredOrdersInfo {
+    /// Id of the order.
+    pub order_id: Uuid,
+    /// Trade index of the order as seen by the requesting user.
+    pub trade_index: i64,
+    /// Current status of the order, serialized as kebab-case.
+    pub status: String,
+    /// Trade pubkey of the **other** party on this order, when the order has
+    /// one yet (`None` on an order nobody has taken).
+    ///
+    /// Peer chat is end-to-end between the two trade keys and the daemon
+    /// never sees it, so a client that lost its local database can re-derive
+    /// the conversation keys — the HKDF split of the ECDH shared secret, see
+    /// <https://mostro.network/protocol/chat.html> — only if it learns this
+    /// pubkey again. The trade index above gives back the client's own key;
+    /// this gives back the other half, and with both the client can re-fetch
+    /// its chat history from the relays after a restore.
+    ///
+    /// `#[serde(default)]` so a client built against this version still
+    /// parses the payload of a daemon that predates the field.
+    #[serde(default)]
+    pub counterparty_trade_pubkey: Option<String>,
+}
+
+/// Identifies which party of an order opened a dispute.
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "lowercase"))]
+pub enum DisputeInitiator {
+    /// The buyer opened the dispute.
+    Buyer,
+    /// The seller opened the dispute.
+    Seller,
+}
+
+/// Minimal per-dispute information returned to a client on session restore.
+#[cfg_attr(feature = "sqlx", derive(FromRow))]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RestoredDisputesInfo {
+    /// Id of the dispute.
+    pub dispute_id: Uuid,
+    /// Id of the order the dispute is attached to.
+    pub order_id: Uuid,
+    /// Trade index of the dispute as seen by the requesting user.
+    pub trade_index: i64,
+    /// Current status of the dispute, serialized as kebab-case.
+    pub status: String,
+    /// Who initiated the dispute: [`DisputeInitiator::Buyer`],
+    /// [`DisputeInitiator::Seller`], or `None` when unknown.
+    pub initiator: Option<DisputeInitiator>,
+    /// Public key of the solver assigned to the dispute, `None` if no
+    /// solver has taken it yet.
+    pub solver_pubkey: Option<String>,
+}
+
+/// Bundle of orders and disputes returned on a session restore.
+///
+/// Carried inside [`Payload::RestoreData`]. The server typically sends this
+/// struct in the response to a [`Action::RestoreSession`] request.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct RestoreSessionInfo {
+    /// Orders associated with the requesting user.
+    #[serde(rename = "orders")]
+    pub restore_orders: Vec<RestoredOrdersInfo>,
+    /// Disputes associated with the requesting user.
+    #[serde(rename = "disputes")]
+    pub restore_disputes: Vec<RestoredDisputesInfo>,
+}
+
+/// Bond resolution carried by [`Action::AdminSettle`] /
+/// [`Action::AdminCancel`].
+///
+/// Lets the solver express slash decisions independently from the trade
+/// outcome (settle vs cancel). Absent payload (`null`) ⇒ neither bond is
+/// slashed (release-by-default, coherent with the "when in doubt, release"
+/// invariant).
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
+pub struct BondResolution {
+    /// Slash the seller's bond (if posted).
+    pub slash_seller: bool,
+    /// Slash the buyer's bond (if posted).
+    pub slash_buyer: bool,
+}
+
+/// Outbound side of the bond payout invoice request carried by
+/// [`Action::AddBondInvoice`] (Mostro → winning counterparty).
+///
+/// Asks the recipient for a bolt11 sized at `order.amount` (= the
+/// counterparty share of a slashed bond) and ships the slash anchor
+/// `slashed_at` so the client can compute the forfeit deadline as
+/// `slashed_at + bond_payout_claim_window_days * 86_400` — accurate even
+/// when the message lands days late because the recipient or their relay
+/// was offline.
+///
+/// The reply (counterparty → Mostro) reuses [`Payload::PaymentRequest`]
+/// with the actual bolt11 in the second tuple slot, so the two
+/// directions of the same action are wire-distinguishable by payload
+/// shape rather than by message ordering.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct BondPayoutRequest {
+    /// Order context (id, kind, `amount` = counterparty share in sats,
+    /// fiat metadata, etc.). Same [`SmallOrder`] shape the client
+    /// already renders for other order-bearing actions.
+    pub order: SmallOrder,
+    /// Unix timestamp (seconds, UTC) at which Mostro recorded the slash
+    /// decision. Frozen at the `Locked → PendingPayout` CAS and shipped
+    /// verbatim on every cadence retry of this request — clients can
+    /// rely on it as a fixed anchor.
+    pub slashed_at: i64,
+}
+
+/// Request carried by [`Action::ExportReputation`].
+///
+/// The source account is never named here: the issuer attests the identity
+/// the transport proved.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ReputationExportRequest {
+    /// Identity the attestation will name, as 64 lowercase hex characters.
+    pub destination: String,
+    /// A rebind authorisation serialised as event JSON, signed by the
+    /// identity the account is currently bound to, when `destination` is a
+    /// different one. See
+    /// [`crate::reputation::ReputationRebind`].
+    #[serde(default)]
+    pub rebind: Option<String>,
+}
+
+/// Cashu 2-of-3 multisig escrow lock submitted by the seller.
+///
+/// Carried inside [`Payload::CashuLockProof`] on [`Action::AddCashuEscrow`]
+/// (seller → Mostro). It describes a NUT-11 P2PK token locked to a 2-of-3
+/// spending condition over the buyer (`P_B`), seller (`P_S`) and Mostro
+/// (`P_M`) pubkeys. Mostro validates the condition and confirms the proofs
+/// are unspent at the mint (NUT-07 `checkstate`) without ever taking
+/// custody — it only ever holds one of the three keys.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct CashuLockProof {
+    /// Serialized Cashu token (the locked ecash) as submitted by the seller.
+    pub token: String,
+    /// URL of the mint hosting the escrowed proofs. Must match the node's
+    /// configured mint.
+    pub mint_url: String,
+    /// Buyer pubkey embedded in the 2-of-3 condition (`P_B`), hex.
+    pub buyer_pubkey: String,
+    /// Seller pubkey embedded in the 2-of-3 condition (`P_S`), hex.
+    pub seller_pubkey: String,
+    /// Mostro/arbitrator pubkey embedded in the 2-of-3 condition (`P_M`),
+    /// hex.
+    pub mostro_pubkey: String,
+    /// Serialized Cashu token locked 1-of-1 to `P_M`, carrying the Mostro fee
+    /// the seller funds alongside the escrow. `None` when the node charges no
+    /// fee. Omitted from the wire form when absent, so proofs without a fee
+    /// serialize exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_token: Option<String>,
+}
+
+impl CashuLockProof {
+    /// Create a new [`CashuLockProof`].
+    pub fn new(
+        token: String,
+        mint_url: String,
+        buyer_pubkey: String,
+        seller_pubkey: String,
+        mostro_pubkey: String,
+    ) -> Self {
+        Self {
+            token,
+            mint_url,
+            buyer_pubkey,
+            seller_pubkey,
+            mostro_pubkey,
+            fee_token: None,
+        }
+    }
+
+    /// Attach the seller-funded fee token (a Cashu token locked to `P_M`),
+    /// returning the updated proof.
+    pub fn with_fee_token(mut self, fee_token: String) -> Self {
+        self.fee_token = Some(fee_token);
+        self
+    }
+
+    /// Parse a [`CashuLockProof`] from its JSON representation.
+    pub fn from_json(json: &str) -> Result<Self, ServiceError> {
+        serde_json::from_str(json).map_err(|_| ServiceError::MessageSerializationError)
+    }
+
+    /// Serialize the lock proof to a JSON string.
+    pub fn as_json(&self) -> Result<String, ServiceError> {
+        serde_json::to_string(&self).map_err(|_| ServiceError::MessageSerializationError)
+    }
+}
+
+/// Mostro's `P_M` signature for a single escrowed proof.
+///
+/// Under NUT-11 SIG_INPUTS each input proof carries its own witness with a
+/// signature over that proof's own secret, so a Cashu token split across
+/// several denominations needs one signature per proof. The dispute winner
+/// matches each signature to its proof by `secret` when populating the
+/// per-proof witnesses and assembling the mint swap. See
+/// [`Payload::CashuSignatures`].
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct CashuProofSignature {
+    /// NUT-11 secret of the proof this signature applies to, exactly as it
+    /// appears in the escrowed token. Used to match the signature to its
+    /// proof.
+    pub secret: String,
+    /// Mostro's `P_M` signature (hex) over `secret`, to be inserted into that
+    /// proof's NUT-11 witness.
+    pub signature: String,
+}
+
+impl CashuProofSignature {
+    /// Create a new [`CashuProofSignature`].
+    pub fn new(secret: String, signature: String) -> Self {
+        Self { secret, signature }
+    }
+}
+
+/// Typed payload attached to a [`MessageKind`].
+///
+/// Each variant corresponds to a set of [`Action`] values that can legally
+/// carry it (see [`MessageKind::verify`]). Serialized in `snake_case` so
+/// that the variant name is the JSON discriminator.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum Payload {
+    /// A compact representation of an order used by [`Action::NewOrder`].
+    Order(SmallOrder),
+    /// Lightning payment request plus optional amount override.
+    ///
+    /// Used by [`Action::PayInvoice`], [`Action::PayBondInvoice`],
+    /// [`Action::AddInvoice`], [`Action::AddBondInvoice`] and
+    /// [`Action::TakeSell`]. The [`SmallOrder`]
+    /// carries the matching order when relevant; the `String` is a BOLT-11
+    /// invoice.
+    PaymentRequest(Option<SmallOrder>, String, Option<Amount>),
+    /// Free-form text message used by DMs.
+    TextMessage(String),
+    /// Peer disclosure (trade pubkey and optional reputation).
+    Peer(Peer),
+    /// Rating value the user wants to attach to a completed trade.
+    RatingUser(u8),
+    /// Raw amount in satoshis (for actions that accept an amount override).
+    Amount(Amount),
+    /// Dispute context: the dispute id plus optional
+    /// [`SolverDisputeInfo`] bundle sent to solvers.
+    Dispute(Uuid, Option<SolverDisputeInfo>),
+    /// Reason carried by a [`Action::CantDo`] response.
+    CantDo(Option<CantDoReason>),
+    /// Next trade key and index announced by the maker of a range order
+    /// when it emits [`Action::Release`] or [`Action::FiatSent`].
+    NextTrade(String, u32),
+    /// Retry configuration surfaced by [`Action::PaymentFailed`].
+    PaymentFailed(PaymentFailedInfo),
+    /// Payload returned by the server on a session restore.
+    RestoreData(RestoreSessionInfo),
+    /// Vector of order ids (lightweight listing).
+    Ids(Vec<Uuid>),
+    /// Vector of [`SmallOrder`] values (full listing).
+    Orders(Vec<SmallOrder>),
+    /// Slash decisions carried by [`Action::AdminSettle`] /
+    /// [`Action::AdminCancel`]. See [`BondResolution`].
+    BondResolution(BondResolution),
+    /// Outbound bond payout invoice request carried by
+    /// [`Action::AddBondInvoice`] (Mostro → counterparty). The reply
+    /// direction (counterparty → Mostro) keeps using
+    /// [`Payload::PaymentRequest`] with the actual bolt11. See
+    /// [`BondPayoutRequest`].
+    BondPayoutRequest(BondPayoutRequest),
+    /// Cashu 2-of-3 multisig escrow lock submitted on
+    /// [`Action::AddCashuEscrow`] (seller → Mostro). See [`CashuLockProof`].
+    CashuLockProof(CashuLockProof),
+    /// Mostro's NUT-11 P2PK signatures over the escrowed proofs, one entry
+    /// per proof. Carried by [`Action::CashuPmSignature`] when Mostro delivers
+    /// its `P_M` signatures to a dispute winner. A token split across several
+    /// denominations contains multiple proofs, and SIG_INPUTS requires each to
+    /// be signed independently. See [`CashuProofSignature`].
+    CashuSignatures(Vec<CashuProofSignature>),
+    /// Buyer's hash-only commitment to its fiat payer account, carried by
+    /// [`Action::DeclarePayer`] and [`Action::PayerDeclared`]. See
+    /// [`PayerDeclaration`].
+    PayerDeclaration(PayerDeclaration),
+    /// Aggregate history of a `(buyer, payment_hash)` pair, carried by
+    /// [`Action::PaymentHistory`] from Mostro to the seller. See
+    /// [`PaymentHistory`].
+    PaymentHistory(PaymentHistory),
+    /// Destination identity and optional rebind authorisation carried by
+    /// [`Action::ExportReputation`]. See [`ReputationExportRequest`].
+    ReputationExportRequest(ReputationExportRequest),
+    /// A reputation attestation (kind `38388`) serialised as event JSON,
+    /// carried by [`Action::ReputationExported`] and
+    /// [`Action::ImportReputation`]. Parse it with
+    /// [`ReputationAttestation::parse_json`](crate::reputation::ReputationAttestation::parse_json);
+    /// a client forwards it unchanged.
+    ReputationAttestation(String),
+    /// The requester's own reputation on this node, carried by
+    /// [`Action::UserInfo`] from Mostro to the client.
+    UserInfo(UserInfo),
+}
+
+#[allow(dead_code)]
+impl MessageKind {
+    /// Build a new [`MessageKind`] stamped with the current protocol
+    /// version (`PROTOCOL_VER`).
+    pub fn new(
+        id: Option<Uuid>,
+        request_id: Option<u64>,
+        trade_index: Option<i64>,
+        action: Action,
+        payload: Option<Payload>,
+    ) -> Self {
+        Self {
+            version: PROTOCOL_VER,
+            request_id,
+            trade_index,
+            id,
+            action,
+            payload,
+        }
+    }
+    /// Parse a [`MessageKind`] from its JSON representation.
+    pub fn from_json(json: &str) -> Result<Self, ServiceError> {
+        serde_json::from_str(json).map_err(|_| ServiceError::MessageSerializationError)
+    }
+    /// Serialize the [`MessageKind`] to a JSON string.
+    pub fn as_json(&self) -> Result<String, ServiceError> {
+        serde_json::to_string(&self).map_err(|_| ServiceError::MessageSerializationError)
+    }
+
+    /// Return a clone of the [`Action`] carried by this message.
+    pub fn get_action(&self) -> Action {
+        self.action.clone()
+    }
+
+    /// Extract the `(next_trade_pubkey, next_trade_index)` pair from a
+    /// [`Payload::NextTrade`] payload.
+    ///
+    /// Returns `Ok(None)` when there is no payload at all and
+    /// [`ServiceError::InvalidPayload`] when the payload is present but of
+    /// a different variant.
+    pub fn get_next_trade_key(&self) -> Result<Option<(String, u32)>, ServiceError> {
+        match &self.payload {
+            Some(Payload::NextTrade(key, index)) => Ok(Some((key.to_string(), *index))),
+            None => Ok(None),
+            _ => Err(ServiceError::InvalidPayload),
+        }
+    }
+
+    /// Extract the rating value from a [`Payload::RatingUser`] payload,
+    /// validating it against
+    /// [`MIN_RATING`]`..=`[`MAX_RATING`].
+    ///
+    /// Returns [`ServiceError::InvalidRating`] when the payload shape is
+    /// wrong and [`ServiceError::InvalidRatingValue`] when the value is out
+    /// of range.
+    pub fn get_rating(&self) -> Result<u8, ServiceError> {
+        if let Some(Payload::RatingUser(v)) = self.payload.to_owned() {
+            if !(MIN_RATING..=MAX_RATING).contains(&v) {
+                return Err(ServiceError::InvalidRatingValue);
+            }
+            Ok(v)
+        } else {
+            Err(ServiceError::InvalidRating)
+        }
+    }
+
+    /// Check that the payload, id and trade index are consistent with the
+    /// action carried by this message.
+    ///
+    /// Returns `true` when the combination is well-formed and `false`
+    /// otherwise; Mostro uses this method to reject malformed requests
+    /// before processing them.
+    pub fn verify(&self) -> bool {
+        match &self.action {
+            Action::NewOrder => matches!(&self.payload, Some(Payload::Order(_))),
+            Action::PayInvoice | Action::PayBondInvoice | Action::AddInvoice => {
+                if self.id.is_none() {
+                    return false;
+                }
+                matches!(&self.payload, Some(Payload::PaymentRequest(_, _, _)))
+            }
+            Action::AddBondInvoice => {
+                if self.id.is_none() {
+                    return false;
+                }
+                // Two valid shapes:
+                //   - `BondPayoutRequest` for the outbound direction
+                //     (Mostro → counterparty, "send me a bolt11").
+                //   - `PaymentRequest` for the inbound reply
+                //     (counterparty → Mostro, "here is the bolt11").
+                matches!(
+                    &self.payload,
+                    Some(Payload::BondPayoutRequest(_)) | Some(Payload::PaymentRequest(_, _, _))
+                )
+            }
+            Action::AdminSettle | Action::AdminCancel => {
+                if self.id.is_none() {
+                    return false;
+                }
+                matches!(&self.payload, None | Some(Payload::BondResolution(_)))
+            }
+            Action::AddCashuEscrow => {
+                if self.id.is_none() {
+                    return false;
+                }
+                matches!(&self.payload, Some(Payload::CashuLockProof(_)))
+            }
+            Action::CashuPmSignature => {
+                if self.id.is_none() {
+                    return false;
+                }
+                matches!(&self.payload, Some(Payload::CashuSignatures(sigs)) if !sigs.is_empty())
+            }
+            Action::DeclarePayer | Action::PayerDeclared => {
+                if self.id.is_none() {
+                    return false;
+                }
+                matches!(&self.payload, Some(Payload::PayerDeclaration(_)))
+            }
+            Action::PaymentHistory => {
+                if self.id.is_none() {
+                    return false;
+                }
+                // Two valid shapes: the seller's query (no payload) and
+                // Mostro's push / reply (the aggregate history).
+                matches!(&self.payload, None | Some(Payload::PaymentHistory(_)))
+            }
+            Action::TakeSell
+            | Action::TakeBuy
+            | Action::FiatSent
+            | Action::FiatSentOk
+            | Action::Release
+            | Action::Released
+            | Action::Dispute
+            | Action::AdminCanceled
+            | Action::AdminSettled
+            | Action::Rate
+            | Action::RateReceived
+            | Action::AdminTakeDispute
+            | Action::AdminTookDispute
+            | Action::DisputeInitiatedByYou
+            | Action::DisputeInitiatedByPeer
+            | Action::WaitingBuyerInvoice
+            | Action::PurchaseCompleted
+            | Action::BondPayoutCompleted
+            | Action::BondSlashed
+            | Action::HoldInvoicePaymentAccepted
+            | Action::HoldInvoicePaymentSettled
+            | Action::HoldInvoicePaymentCanceled
+            | Action::WaitingSellerToPay
+            | Action::BuyerTookOrder
+            | Action::BuyerInvoiceAccepted
+            | Action::BondInvoiceAccepted
+            | Action::CooperativeCancelInitiatedByYou
+            | Action::CooperativeCancelInitiatedByPeer
+            | Action::CooperativeCancelAccepted
+            | Action::Cancel
+            | Action::InvoiceUpdated
+            | Action::AdminAddSolver
+            | Action::SendDm
+            | Action::TradePubkey
+            | Action::CashuEscrowLocked
+            | Action::Canceled => {
+                if self.id.is_none() {
+                    return false;
+                }
+                // Payloads owned by one action family are refused here.
+                !matches!(
+                    &self.payload,
+                    Some(Payload::BondResolution(_))
+                        | Some(Payload::BondPayoutRequest(_))
+                        | Some(Payload::PayerDeclaration(_))
+                        | Some(Payload::PaymentHistory(_))
+                        | Some(Payload::UserInfo(_))
+                )
+            }
+            Action::LastTradeIndex | Action::RestoreSession => self.payload.is_none(),
+            Action::UserInfo => {
+                self.id.is_none() && matches!(&self.payload, None | Some(Payload::UserInfo(_)))
+            }
+            Action::PaymentFailed => {
+                if self.id.is_none() {
+                    return false;
+                }
+                matches!(&self.payload, Some(Payload::PaymentFailed(_)))
+            }
+            Action::RateUser => {
+                matches!(&self.payload, Some(Payload::RatingUser(_)))
+            }
+            Action::CantDo => {
+                matches!(&self.payload, Some(Payload::CantDo(_)))
+            }
+            Action::Orders => {
+                matches!(
+                    &self.payload,
+                    Some(Payload::Ids(_)) | Some(Payload::Orders(_))
+                )
+            }
+            Action::ExportReputation => {
+                self.id.is_none()
+                    && matches!(&self.payload, Some(Payload::ReputationExportRequest(_)))
+            }
+            Action::ReputationExported | Action::ImportReputation => {
+                self.id.is_none()
+                    && matches!(&self.payload, Some(Payload::ReputationAttestation(_)))
+            }
+            Action::ReputationImported => self.id.is_none() && self.payload.is_none(),
+            Action::RequestTelegramCode => self.id.is_none() && self.payload.is_none(),
+            Action::TelegramCode => matches!(&self.payload, Some(Payload::TextMessage(_))),
+        }
+    }
+
+    /// Return the [`SmallOrder`] carried by a [`Action::NewOrder`] message.
+    ///
+    /// Yields `None` if the action is not `NewOrder` or the payload is of a
+    /// different variant.
+    pub fn get_order(&self) -> Option<&SmallOrder> {
+        if self.action != Action::NewOrder {
+            return None;
+        }
+        match &self.payload {
+            Some(Payload::Order(o)) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// Return the Lightning payment request embedded in a message.
+    ///
+    /// Valid only for [`Action::TakeSell`], [`Action::AddInvoice`],
+    /// [`Action::AddBondInvoice`] and [`Action::NewOrder`]. For `NewOrder`,
+    /// the invoice is read from the [`SmallOrder::buyer_invoice`] field.
+    /// Returns `None` otherwise.
+    pub fn get_payment_request(&self) -> Option<String> {
+        if self.action != Action::TakeSell
+            && self.action != Action::AddInvoice
+            && self.action != Action::AddBondInvoice
+            && self.action != Action::NewOrder
+        {
+            return None;
+        }
+        match &self.payload {
+            Some(Payload::PaymentRequest(_, pr, _)) => Some(pr.to_owned()),
+            Some(Payload::Order(ord)) => ord.buyer_invoice.to_owned(),
+            _ => None,
+        }
+    }
+
+    /// Return the amount override embedded in a [`Action::TakeSell`] or
+    /// [`Action::TakeBuy`] message, either from a [`Payload::Amount`] or
+    /// from the third element of a [`Payload::PaymentRequest`].
+    pub fn get_amount(&self) -> Option<Amount> {
+        if self.action != Action::TakeSell && self.action != Action::TakeBuy {
+            return None;
+        }
+        match &self.payload {
+            Some(Payload::PaymentRequest(_, _, amount)) => *amount,
+            Some(Payload::Amount(amount)) => Some(*amount),
+            _ => None,
+        }
+    }
+
+    /// Borrow the optional payload.
+    pub fn get_payload(&self) -> Option<&Payload> {
+        self.payload.as_ref()
+    }
+
+    /// Return `(true, index)` when the message carries a trade index,
+    /// `(false, 0)` otherwise.
+    pub fn has_trade_index(&self) -> (bool, i64) {
+        if let Some(index) = self.trade_index {
+            return (true, index);
+        }
+        (false, 0)
+    }
+
+    /// Return the trade index carried by the message, or `0` when absent.
+    pub fn trade_index(&self) -> i64 {
+        if let Some(index) = self.trade_index {
+            return index;
+        }
+        0
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::message::{
+        Action, BondPayoutRequest, CashuLockProof, CashuProofSignature, Message, MessageKind,
+        Payload, Peer,
+    };
+    use crate::order::SmallOrder;
+    use crate::payer::{payment_hash, BuyerMode, PayerDeclaration, PaymentHistory};
+    use crate::user::UserInfo;
+    use nostr_sdk::prelude::Keys;
+    use uuid::uuid;
+
+    #[test]
+    fn test_peer_with_reputation() {
+        // Test creating a Peer with reputation information
+        let reputation = UserInfo {
+            rating: 4.5,
+            reviews: 10,
+            operating_days: 30,
+            since: None,
+        };
+        let peer = Peer::new(
+            "npub1testjsf0runcqdht5apkfcalajxkf8txdxqqk5kgm0agc38ke4vsfsgzf8".to_string(),
+            Some(reputation.clone()),
+        );
+
+        // Assert the fields are set correctly
+        assert_eq!(
+            peer.pubkey,
+            "npub1testjsf0runcqdht5apkfcalajxkf8txdxqqk5kgm0agc38ke4vsfsgzf8"
+        );
+        assert!(peer.reputation.is_some());
+        let peer_reputation = peer.reputation.clone().unwrap();
+        assert_eq!(peer_reputation.rating, 4.5);
+        assert_eq!(peer_reputation.reviews, 10);
+        assert_eq!(peer_reputation.operating_days, 30);
+
+        // Test JSON serialization and deserialization
+        let json = peer.as_json().unwrap();
+        let deserialized_peer = Peer::from_json(&json).unwrap();
+        assert_eq!(deserialized_peer.pubkey, peer.pubkey);
+        assert!(deserialized_peer.reputation.is_some());
+        let deserialized_reputation = deserialized_peer.reputation.unwrap();
+        assert_eq!(deserialized_reputation.rating, 4.5);
+        assert_eq!(deserialized_reputation.reviews, 10);
+        assert_eq!(deserialized_reputation.operating_days, 30);
+    }
+
+    #[test]
+    fn test_peer_without_reputation() {
+        // Test creating a Peer without reputation information
+        let peer = Peer::new(
+            "npub1testjsf0runcqdht5apkfcalajxkf8txdxqqk5kgm0agc38ke4vsfsgzf8".to_string(),
+            None,
+        );
+
+        // Assert the reputation field is None
+        assert_eq!(
+            peer.pubkey,
+            "npub1testjsf0runcqdht5apkfcalajxkf8txdxqqk5kgm0agc38ke4vsfsgzf8"
+        );
+        assert!(peer.reputation.is_none());
+
+        // Test JSON serialization and deserialization
+        let json = peer.as_json().unwrap();
+        let deserialized_peer = Peer::from_json(&json).unwrap();
+        assert_eq!(deserialized_peer.pubkey, peer.pubkey);
+        assert!(deserialized_peer.reputation.is_none());
+    }
+
+    #[test]
+    fn test_peer_in_message() {
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+
+        // Test with reputation
+        let reputation = UserInfo {
+            rating: 4.5,
+            reviews: 10,
+            operating_days: 30,
+            since: None,
+        };
+        let peer_with_reputation = Peer::new(
+            "npub1testjsf0runcqdht5apkfcalajxkf8txdxqqk5kgm0agc38ke4vsfsgzf8".to_string(),
+            Some(reputation),
+        );
+        let payload_with_reputation = Payload::Peer(peer_with_reputation);
+        let message_with_reputation = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::FiatSentOk,
+            Some(payload_with_reputation),
+        ));
+
+        // Verify message with reputation
+        assert!(message_with_reputation.verify());
+        let message_json = message_with_reputation.as_json().unwrap();
+        let deserialized_message = Message::from_json(&message_json).unwrap();
+        assert!(deserialized_message.verify());
+
+        // Test without reputation
+        let peer_without_reputation = Peer::new(
+            "npub1testjsf0runcqdht5apkfcalajxkf8txdxqqk5kgm0agc38ke4vsfsgzf8".to_string(),
+            None,
+        );
+        let payload_without_reputation = Payload::Peer(peer_without_reputation);
+        let message_without_reputation = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::FiatSentOk,
+            Some(payload_without_reputation),
+        ));
+
+        // Verify message without reputation
+        assert!(message_without_reputation.verify());
+        let message_json = message_without_reputation.as_json().unwrap();
+        let deserialized_message = Message::from_json(&message_json).unwrap();
+        assert!(deserialized_message.verify());
+    }
+
+    #[test]
+    fn test_bond_payout_request_payload_verifies_on_add_bond_invoice() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let order = SmallOrder {
+            id: Some(order_id),
+            kind: None,
+            status: None,
+            amount: 500,
+            fiat_code: "USD".to_string(),
+            min_amount: None,
+            max_amount: None,
+            fiat_amount: 0,
+            payment_method: "lightning".to_string(),
+            premium: 0,
+            buyer_trade_pubkey: None,
+            seller_trade_pubkey: None,
+            buyer_invoice: None,
+            created_at: None,
+            expires_at: None,
+            cashu_mint_url: None,
+        };
+        let payload = Payload::BondPayoutRequest(BondPayoutRequest {
+            order,
+            slashed_at: 1_734_000_000,
+        });
+        let kind = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::AddBondInvoice,
+            Some(payload),
+        );
+        assert!(
+            kind.verify(),
+            "BondPayoutRequest must verify on AddBondInvoice"
+        );
+
+        // Round-trip through JSON to catch a serde-rename mismatch on the
+        // new snake_case discriminator.
+        let m = Message::Order(kind);
+        let json = m.as_json().unwrap();
+        assert!(json.contains("bond_payout_request"));
+        let back = Message::from_json(&json).unwrap();
+        assert!(back.verify());
+    }
+
+    #[test]
+    fn test_bond_payout_request_payload_rejected_on_wrong_action() {
+        // BondPayoutRequest on any action other than AddBondInvoice must
+        // fail verification — the new variant is opt-in per action.
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let order = SmallOrder {
+            id: Some(order_id),
+            kind: None,
+            status: None,
+            amount: 500,
+            fiat_code: "USD".to_string(),
+            min_amount: None,
+            max_amount: None,
+            fiat_amount: 0,
+            payment_method: "lightning".to_string(),
+            premium: 0,
+            buyer_trade_pubkey: None,
+            seller_trade_pubkey: None,
+            buyer_invoice: None,
+            created_at: None,
+            expires_at: None,
+            cashu_mint_url: None,
+        };
+
+        // Compile-time exhaustiveness guard: adding a new Action variant
+        // forces this match to be updated, which in turn forces a
+        // decision about whether the new variant belongs in
+        // `other_actions` below.
+        let _exhaustive: fn(Action) = |a| match a {
+            Action::AddBondInvoice => {}
+            Action::NewOrder
+            | Action::TakeSell
+            | Action::TakeBuy
+            | Action::PayInvoice
+            | Action::PayBondInvoice
+            | Action::FiatSent
+            | Action::FiatSentOk
+            | Action::Release
+            | Action::Released
+            | Action::Cancel
+            | Action::Canceled
+            | Action::CooperativeCancelInitiatedByYou
+            | Action::CooperativeCancelInitiatedByPeer
+            | Action::DisputeInitiatedByYou
+            | Action::DisputeInitiatedByPeer
+            | Action::CooperativeCancelAccepted
+            | Action::BuyerInvoiceAccepted
+            | Action::BondInvoiceAccepted
+            | Action::PurchaseCompleted
+            | Action::BondPayoutCompleted
+            | Action::BondSlashed
+            | Action::HoldInvoicePaymentAccepted
+            | Action::HoldInvoicePaymentSettled
+            | Action::HoldInvoicePaymentCanceled
+            | Action::WaitingSellerToPay
+            | Action::WaitingBuyerInvoice
+            | Action::AddInvoice
+            | Action::BuyerTookOrder
+            | Action::Rate
+            | Action::RateUser
+            | Action::RateReceived
+            | Action::CantDo
+            | Action::Dispute
+            | Action::AdminCancel
+            | Action::AdminCanceled
+            | Action::AdminSettle
+            | Action::AdminSettled
+            | Action::AdminAddSolver
+            | Action::AdminTakeDispute
+            | Action::AdminTookDispute
+            | Action::PaymentFailed
+            | Action::InvoiceUpdated
+            | Action::SendDm
+            | Action::TradePubkey
+            | Action::RestoreSession
+            | Action::LastTradeIndex
+            | Action::UserInfo
+            | Action::AddCashuEscrow
+            | Action::CashuEscrowLocked
+            | Action::CashuPmSignature
+            | Action::DeclarePayer
+            | Action::PayerDeclared
+            | Action::PaymentHistory
+            | Action::ExportReputation
+            | Action::ReputationExported
+            | Action::ImportReputation
+            | Action::ReputationImported
+            | Action::RequestTelegramCode
+            | Action::TelegramCode
+            | Action::Orders => {}
+        };
+
+        let other_actions: &[Action] = &[
+            Action::NewOrder,
+            Action::TakeSell,
+            Action::TakeBuy,
+            Action::PayInvoice,
+            Action::PayBondInvoice,
+            Action::FiatSent,
+            Action::FiatSentOk,
+            Action::Release,
+            Action::Released,
+            Action::Cancel,
+            Action::Canceled,
+            Action::CooperativeCancelInitiatedByYou,
+            Action::CooperativeCancelInitiatedByPeer,
+            Action::DisputeInitiatedByYou,
+            Action::DisputeInitiatedByPeer,
+            Action::CooperativeCancelAccepted,
+            Action::BuyerInvoiceAccepted,
+            Action::BondInvoiceAccepted,
+            Action::PurchaseCompleted,
+            Action::BondPayoutCompleted,
+            Action::BondSlashed,
+            Action::HoldInvoicePaymentAccepted,
+            Action::HoldInvoicePaymentSettled,
+            Action::HoldInvoicePaymentCanceled,
+            Action::WaitingSellerToPay,
+            Action::WaitingBuyerInvoice,
+            Action::AddInvoice,
+            Action::BuyerTookOrder,
+            Action::Rate,
+            Action::RateUser,
+            Action::RateReceived,
+            Action::CantDo,
+            Action::Dispute,
+            Action::AdminCancel,
+            Action::AdminCanceled,
+            Action::AdminSettle,
+            Action::AdminSettled,
+            Action::AdminAddSolver,
+            Action::AdminTakeDispute,
+            Action::AdminTookDispute,
+            Action::PaymentFailed,
+            Action::InvoiceUpdated,
+            Action::SendDm,
+            Action::TradePubkey,
+            Action::RestoreSession,
+            Action::LastTradeIndex,
+            Action::UserInfo,
+            Action::Orders,
+            Action::AddCashuEscrow,
+            Action::CashuEscrowLocked,
+            Action::CashuPmSignature,
+            Action::DeclarePayer,
+            Action::PayerDeclared,
+            Action::PaymentHistory,
+            Action::ExportReputation,
+            Action::ReputationExported,
+            Action::ImportReputation,
+            Action::ReputationImported,
+            Action::RequestTelegramCode,
+            Action::TelegramCode,
+        ];
+
+        for action in other_actions {
+            let payload = Payload::BondPayoutRequest(BondPayoutRequest {
+                order: order.clone(),
+                slashed_at: 0,
+            });
+            let kind = MessageKind::new(Some(order_id), None, None, action.clone(), Some(payload));
+            assert!(
+                !kind.verify(),
+                "BondPayoutRequest must be rejected on {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_payer_payloads_rejected_on_unrelated_actions() {
+        // PayerDeclaration belongs to DeclarePayer / PayerDeclared and
+        // PaymentHistory to PaymentHistory; every other action refuses both.
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let unrelated = [
+            Action::NewOrder,
+            Action::TakeSell,
+            Action::TakeBuy,
+            Action::PayInvoice,
+            Action::PayBondInvoice,
+            Action::FiatSent,
+            Action::FiatSentOk,
+            Action::Release,
+            Action::Released,
+            Action::Cancel,
+            Action::Canceled,
+            Action::CooperativeCancelInitiatedByYou,
+            Action::CooperativeCancelInitiatedByPeer,
+            Action::DisputeInitiatedByYou,
+            Action::DisputeInitiatedByPeer,
+            Action::CooperativeCancelAccepted,
+            Action::BuyerInvoiceAccepted,
+            Action::BondInvoiceAccepted,
+            Action::PurchaseCompleted,
+            Action::BondPayoutCompleted,
+            Action::BondSlashed,
+            Action::HoldInvoicePaymentAccepted,
+            Action::HoldInvoicePaymentSettled,
+            Action::HoldInvoicePaymentCanceled,
+            Action::WaitingSellerToPay,
+            Action::WaitingBuyerInvoice,
+            Action::AddInvoice,
+            Action::BuyerTookOrder,
+            Action::Rate,
+            Action::RateUser,
+            Action::RateReceived,
+            Action::CantDo,
+            Action::Dispute,
+            Action::AdminCancel,
+            Action::AdminCanceled,
+            Action::AdminSettle,
+            Action::AdminSettled,
+            Action::AdminAddSolver,
+            Action::AdminTakeDispute,
+            Action::AdminTookDispute,
+            Action::PaymentFailed,
+            Action::InvoiceUpdated,
+            Action::SendDm,
+            Action::TradePubkey,
+            Action::RestoreSession,
+            Action::LastTradeIndex,
+            Action::UserInfo,
+            Action::Orders,
+            Action::AddCashuEscrow,
+            Action::CashuEscrowLocked,
+            Action::CashuPmSignature,
+            Action::AddBondInvoice,
+        ];
+        for action in unrelated {
+            for payload in [
+                Payload::PayerDeclaration(PayerDeclaration::new("a".repeat(64))),
+                Payload::PaymentHistory(PaymentHistory::unavailable("a".repeat(64))),
+            ] {
+                let kind =
+                    MessageKind::new(Some(order_id), None, None, action.clone(), Some(payload));
+                assert!(!kind.verify(), "{action:?} must reject {:?}", kind.payload);
+            }
+        }
+    }
+
+    #[test]
+    fn test_bond_payout_ack_actions_verify_and_wire_format() {
+        use crate::message::BondResolution;
+
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+
+        // SmallOrder whose `amount` is the counterparty share carried by
+        // these Mostro → winner bond-payout acknowledgements.
+        let order = || SmallOrder {
+            id: Some(order_id),
+            kind: None,
+            status: None,
+            amount: 500,
+            fiat_code: "USD".to_string(),
+            min_amount: None,
+            max_amount: None,
+            fiat_amount: 0,
+            payment_method: "lightning".to_string(),
+            premium: 0,
+            buyer_trade_pubkey: None,
+            seller_trade_pubkey: None,
+            buyer_invoice: None,
+            created_at: None,
+            expires_at: None,
+            cashu_mint_url: None,
+        };
+
+        // These bond notifications carry Payload::Order (BondInvoiceAccepted
+        // / BondPayoutCompleted are the duals of BuyerInvoiceAccepted /
+        // PurchaseCompleted; BondSlashed informs the slashed user): id
+        // required, Payload::Order accepted, and the bond request/resolution
+        // payloads rejected.
+        for (action, discriminator) in [
+            (Action::BondInvoiceAccepted, "bond-invoice-accepted"),
+            (Action::BondPayoutCompleted, "bond-payout-completed"),
+            (Action::BondSlashed, "bond-slashed"),
+        ] {
+            // id set + Payload::Order verifies.
+            let ok = Message::Order(MessageKind::new(
+                Some(order_id),
+                Some(1),
+                Some(2),
+                action.clone(),
+                Some(Payload::Order(order())),
+            ));
+            assert!(ok.verify(), "{action:?} + Order should verify");
+
+            // Missing id is invalid.
+            let no_id = Message::Order(MessageKind::new(
+                None,
+                Some(1),
+                Some(2),
+                action.clone(),
+                Some(Payload::Order(order())),
+            ));
+            assert!(!no_id.verify(), "{action:?} without id must be rejected");
+
+            // BondResolution payload is rejected on these outbound acks.
+            let with_resolution = Message::Order(MessageKind::new(
+                Some(order_id),
+                Some(1),
+                Some(2),
+                action.clone(),
+                Some(Payload::BondResolution(BondResolution {
+                    slash_seller: true,
+                    slash_buyer: false,
+                })),
+            ));
+            assert!(
+                !with_resolution.verify(),
+                "{action:?} + BondResolution must be rejected"
+            );
+
+            // BondPayoutRequest payload is rejected too.
+            let with_request = Message::Order(MessageKind::new(
+                Some(order_id),
+                Some(1),
+                Some(2),
+                action.clone(),
+                Some(Payload::BondPayoutRequest(BondPayoutRequest {
+                    order: order(),
+                    slashed_at: 0,
+                })),
+            ));
+            assert!(
+                !with_request.verify(),
+                "{action:?} + BondPayoutRequest must be rejected"
+            );
+
+            // Wire format uses the kebab-case discriminator and round-trips.
+            let json = ok.as_json().unwrap();
+            assert!(
+                json.contains(&format!("\"action\":\"{discriminator}\"")),
+                "expected kebab-case discriminator {discriminator}, got: {json}"
+            );
+            let decoded = Message::from_json(&json).unwrap();
+            assert!(decoded.verify());
+            assert_eq!(decoded.inner_action(), Some(action));
+        }
+    }
+
+    #[test]
+    fn test_payment_failed_payload() {
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+
+        // Test PaymentFailedInfo serialization and deserialization
+        let payment_failed_info = crate::message::PaymentFailedInfo {
+            payment_attempts: 3,
+            payment_retries_interval: 60,
+        };
+
+        let payload = Payload::PaymentFailed(payment_failed_info);
+        let message = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::PaymentFailed,
+            Some(payload),
+        ));
+
+        // Verify message validation
+        assert!(message.verify());
+
+        // Test JSON serialization
+        let message_json = message.as_json().unwrap();
+
+        // Test deserialization
+        let deserialized_message = Message::from_json(&message_json).unwrap();
+        assert!(deserialized_message.verify());
+
+        // Verify the payload contains correct values
+        if let Message::Order(kind) = deserialized_message {
+            if let Some(Payload::PaymentFailed(info)) = kind.payload {
+                assert_eq!(info.payment_attempts, 3);
+                assert_eq!(info.payment_retries_interval, 60);
+            } else {
+                panic!("Expected PaymentFailed payload");
+            }
+        } else {
+            panic!("Expected Order message");
+        }
+    }
+
+    #[test]
+    fn test_message_payload_signature() {
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let peer = Peer::new(
+            "npub1testjsf0runcqdht5apkfcalajxkf8txdxqqk5kgm0agc38ke4vsfsgzf8".to_string(),
+            None, // Add None for the reputation parameter
+        );
+        let payload = Payload::Peer(peer);
+        let test_message = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::FiatSentOk,
+            Some(payload),
+        ));
+        assert!(test_message.verify());
+        let test_message_json = test_message.as_json().unwrap();
+        // Message should be signed with the trade keys
+        let trade_keys =
+            Keys::parse("110e43647eae221ab1da33ddc17fd6ff423f2b2f49d809b9ffa40794a2ab996c")
+                .unwrap();
+        let sig = Message::sign(test_message_json.clone(), &trade_keys);
+
+        assert!(Message::verify_signature(
+            test_message_json,
+            trade_keys.public_key(),
+            sig
+        ));
+    }
+
+    #[test]
+    fn test_restore_session_message() {
+        // Test RestoreSession request (payload = None)
+        let restore_request_message = Message::Restore(MessageKind::new(
+            None,
+            None,
+            None,
+            Action::RestoreSession,
+            None,
+        ));
+
+        // Verify message validation
+        assert!(restore_request_message.verify());
+        assert_eq!(
+            restore_request_message.inner_action(),
+            Some(Action::RestoreSession)
+        );
+
+        // Test JSON serialization and deserialization for RestoreRequest
+        let message_json = restore_request_message.as_json().unwrap();
+        let deserialized_message = Message::from_json(&message_json).unwrap();
+        assert!(deserialized_message.verify());
+        assert_eq!(
+            deserialized_message.inner_action(),
+            Some(Action::RestoreSession)
+        );
+
+        // Test RestoreSession with RestoreData payload
+        let restored_orders = vec![
+            crate::message::RestoredOrdersInfo {
+                order_id: uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23"),
+                trade_index: 1,
+                status: "active".to_string(),
+                counterparty_trade_pubkey: Some(
+                    "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344".to_string(),
+                ),
+            },
+            crate::message::RestoredOrdersInfo {
+                order_id: uuid!("408e1272-d5f4-47e6-bd97-3504baea9c24"),
+                trade_index: 2,
+                status: "success".to_string(),
+                counterparty_trade_pubkey: None,
+            },
+        ];
+
+        let restored_disputes = vec![
+            crate::message::RestoredDisputesInfo {
+                dispute_id: uuid!("508e1272-d5f4-47e6-bd97-3504baea9c25"),
+                order_id: uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23"),
+                trade_index: 1,
+                status: "initiated".to_string(),
+                initiator: Some(crate::message::DisputeInitiator::Buyer),
+                solver_pubkey: None,
+            },
+            crate::message::RestoredDisputesInfo {
+                dispute_id: uuid!("608e1272-d5f4-47e6-bd97-3504baea9c26"),
+                order_id: uuid!("408e1272-d5f4-47e6-bd97-3504baea9c24"),
+                trade_index: 2,
+                status: "in-progress".to_string(),
+                initiator: None,
+                solver_pubkey: Some(
+                    "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344".to_string(),
+                ),
+            },
+            crate::message::RestoredDisputesInfo {
+                dispute_id: uuid!("708e1272-d5f4-47e6-bd97-3504baea9c27"),
+                order_id: uuid!("508e1272-d5f4-47e6-bd97-3504baea9c25"),
+                trade_index: 3,
+                status: "initiated".to_string(),
+                initiator: Some(crate::message::DisputeInitiator::Seller),
+                solver_pubkey: None,
+            },
+        ];
+
+        let restore_session_info = crate::message::RestoreSessionInfo {
+            restore_orders: restored_orders.clone(),
+            restore_disputes: restored_disputes.clone(),
+        };
+
+        let restore_data_payload = Payload::RestoreData(restore_session_info);
+        let restore_data_message = Message::Restore(MessageKind::new(
+            None,
+            None,
+            None,
+            Action::RestoreSession,
+            Some(restore_data_payload),
+        ));
+
+        // With new logic, any payload for RestoreSession is invalid (must be None)
+        assert!(!restore_data_message.verify());
+
+        // Verify serialization/deserialization of RestoreData payload with all initiator cases
+        let message_json = restore_data_message.as_json().unwrap();
+        let deserialized_restore_message = Message::from_json(&message_json).unwrap();
+
+        if let Message::Restore(kind) = deserialized_restore_message {
+            if let Some(Payload::RestoreData(session_info)) = kind.payload {
+                assert_eq!(session_info.restore_disputes.len(), 3);
+                assert_eq!(
+                    session_info.restore_disputes[0].initiator,
+                    Some(crate::message::DisputeInitiator::Buyer)
+                );
+                assert!(session_info.restore_disputes[0].solver_pubkey.is_none());
+                assert_eq!(session_info.restore_disputes[1].initiator, None);
+                assert_eq!(
+                    session_info.restore_disputes[1].solver_pubkey,
+                    Some(
+                        "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344"
+                            .to_string()
+                    )
+                );
+                assert_eq!(
+                    session_info.restore_disputes[2].initiator,
+                    Some(crate::message::DisputeInitiator::Seller)
+                );
+                assert!(session_info.restore_disputes[2].solver_pubkey.is_none());
+                assert_eq!(
+                    session_info.restore_orders[0].counterparty_trade_pubkey,
+                    Some(
+                        "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344"
+                            .to_string()
+                    )
+                );
+                assert!(session_info.restore_orders[1]
+                    .counterparty_trade_pubkey
+                    .is_none());
+            } else {
+                panic!("Expected RestoreData payload");
+            }
+        } else {
+            panic!("Expected Restore message");
+        }
+    }
+
+    /// A daemon that predates `counterparty_trade_pubkey` sends the payload
+    /// without it; a client built against this version must still parse it.
+    #[test]
+    fn restored_order_without_counterparty_pubkey_still_parses() {
+        let json = r#"{
+            "order_id": "308e1272-d5f4-47e6-bd97-3504baea9c23",
+            "trade_index": 1,
+            "status": "active"
+        }"#;
+
+        let order: crate::message::RestoredOrdersInfo = serde_json::from_str(json).unwrap();
+
+        assert_eq!(order.trade_index, 1);
+        assert_eq!(order.status, "active");
+        assert!(order.counterparty_trade_pubkey.is_none());
+    }
+
+    #[test]
+    fn test_restore_session_message_validation() {
+        // Test that RestoreSession action accepts only payload=None or RestoreData
+        let restore_request_message = Message::Restore(MessageKind::new(
+            None,
+            None,
+            None,
+            Action::RestoreSession,
+            None, // Missing payload
+        ));
+
+        // Verify restore request message
+        assert!(restore_request_message.verify());
+
+        // Test with wrong payload type
+        let wrong_payload = Payload::TextMessage("wrong payload".to_string());
+        let wrong_message = Message::Restore(MessageKind::new(
+            None,
+            None,
+            None,
+            Action::RestoreSession,
+            Some(wrong_payload),
+        ));
+
+        // Should fail validation because RestoreSession only accepts None
+        assert!(!wrong_message.verify());
+
+        // With new logic, presence of id/request_id/trade_index is allowed
+        let with_id = Message::Restore(MessageKind::new(
+            Some(uuid!("00000000-0000-0000-0000-000000000001")),
+            None,
+            None,
+            Action::RestoreSession,
+            None,
+        ));
+        assert!(with_id.verify());
+
+        let with_request_id = Message::Restore(MessageKind::new(
+            None,
+            Some(42),
+            None,
+            Action::RestoreSession,
+            None,
+        ));
+        assert!(with_request_id.verify());
+
+        let with_trade_index = Message::Restore(MessageKind::new(
+            None,
+            None,
+            Some(7),
+            Action::RestoreSession,
+            None,
+        ));
+        assert!(with_trade_index.verify());
+    }
+
+    #[test]
+    fn test_restore_session_message_constructor() {
+        // Test the new_restore constructor
+        let restore_request_message = Message::new_restore(None);
+
+        assert!(matches!(restore_request_message, Message::Restore(_)));
+        assert!(restore_request_message.verify());
+        assert_eq!(
+            restore_request_message.inner_action(),
+            Some(Action::RestoreSession)
+        );
+
+        // Test with RestoreData payload should be invalid now
+        let restore_session_info = crate::message::RestoreSessionInfo {
+            restore_orders: vec![],
+            restore_disputes: vec![],
+        };
+        let restore_data_message =
+            Message::new_restore(Some(Payload::RestoreData(restore_session_info)));
+
+        assert!(matches!(restore_data_message, Message::Restore(_)));
+        assert!(!restore_data_message.verify());
+    }
+
+    #[test]
+    fn test_last_trade_index_valid_message() {
+        let kind = MessageKind::new(None, None, Some(7), Action::LastTradeIndex, None);
+        let msg = Message::Restore(kind);
+
+        assert!(msg.verify());
+
+        // roundtrip
+        let json = msg.as_json().unwrap();
+        let decoded = Message::from_json(&json).unwrap();
+        assert!(decoded.verify());
+
+        // ensure the trade index is propagated
+        let inner = decoded.get_inner_message_kind();
+        assert_eq!(inner.trade_index(), 7);
+        assert_eq!(inner.has_trade_index(), (true, 7));
+    }
+
+    #[test]
+    fn test_last_trade_index_without_id_is_valid() {
+        // With new logic, id is not required; only payload must be None
+        let kind = MessageKind::new(None, None, Some(5), Action::LastTradeIndex, None);
+        let msg = Message::Restore(kind);
+        assert!(msg.verify());
+    }
+
+    #[test]
+    fn test_last_trade_index_with_payload_fails_validation() {
+        // LastTradeIndex does not accept payload
+        let kind = MessageKind::new(
+            None,
+            None,
+            Some(3),
+            Action::LastTradeIndex,
+            Some(Payload::TextMessage("ignored".to_string())),
+        );
+        let msg = Message::Restore(kind);
+        assert!(!msg.verify());
+    }
+
+    #[test]
+    fn test_user_info_request_wire_format() {
+        let json =
+            r#"{"restore":{"version":2,"request_id":123456,"action":"user-info","payload":null}}"#;
+        let msg = Message::from_json(json).unwrap();
+        assert!(msg.verify());
+        let inner = msg.get_inner_message_kind();
+        assert_eq!(inner.action, Action::UserInfo);
+        assert_eq!(inner.request_id, Some(123456));
+        assert!(inner.id.is_none());
+        assert!(inner.payload.is_none());
+
+        let kind = MessageKind::new(None, Some(123456), None, Action::UserInfo, None);
+        let out = Message::Restore(kind).as_json().unwrap();
+        assert!(out.contains(r#""action":"user-info""#));
+    }
+
+    #[test]
+    fn test_user_info_response_wire_format() {
+        let json = r#"{"restore":{"version":2,"request_id":123456,"action":"user-info","payload":{"user_info":{"rating":4.8,"reviews":23,"operating_days":142,"since":1700784000}}}}"#;
+        let msg = Message::from_json(json).unwrap();
+        assert!(msg.verify());
+        match msg.get_inner_message_kind().payload.as_ref() {
+            Some(Payload::UserInfo(info)) => {
+                assert_eq!(info.rating, 4.8);
+                assert_eq!(info.reviews, 23);
+                assert_eq!(info.operating_days, 142);
+                assert_eq!(info.since, Some(1_700_784_000));
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        let value: serde_json::Value = serde_json::from_str(&msg.as_json().unwrap()).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(value["restore"]["action"], expected["restore"]["action"]);
+        assert_eq!(value["restore"]["payload"], expected["restore"]["payload"]);
+    }
+
+    #[test]
+    fn test_user_info_response_unknown_identity_omits_since() {
+        let info = UserInfo {
+            rating: 0.0,
+            reviews: 0,
+            operating_days: 0,
+            since: None,
+        };
+        let kind = MessageKind::new(
+            None,
+            None,
+            None,
+            Action::UserInfo,
+            Some(Payload::UserInfo(info)),
+        );
+        let msg = Message::Restore(kind);
+        assert!(msg.verify());
+        let json = msg.as_json().unwrap();
+        assert!(json.contains(r#""payload":{"user_info":{"#));
+        assert!(!json.contains("since"));
+    }
+
+    #[test]
+    fn test_user_info_rejects_wrong_payload_and_id() {
+        let wrong_payload = MessageKind::new(
+            None,
+            None,
+            None,
+            Action::UserInfo,
+            Some(Payload::Peer(Peer::new("pubkey".to_string(), None))),
+        );
+        assert!(!Message::Restore(wrong_payload).verify());
+
+        let with_id = MessageKind::new(
+            Some(uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23")),
+            None,
+            None,
+            Action::UserInfo,
+            None,
+        );
+        assert!(!Message::Restore(with_id).verify());
+
+        let on_order_action = MessageKind::new(
+            Some(uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23")),
+            None,
+            None,
+            Action::FiatSent,
+            Some(Payload::UserInfo(UserInfo {
+                rating: 0.0,
+                reviews: 0,
+                operating_days: 0,
+                since: None,
+            })),
+        );
+        assert!(!on_order_action.verify());
+    }
+
+    #[test]
+    fn test_user_info_rejected_outside_restore_wrapper() {
+        let request = MessageKind::new(None, Some(1), None, Action::UserInfo, None);
+        assert!(Message::Restore(request.clone()).verify());
+        for msg in [
+            Message::Order(request.clone()),
+            Message::Dispute(request.clone()),
+            Message::CantDo(request.clone()),
+            Message::Rate(request.clone()),
+            Message::Dm(request),
+        ] {
+            assert!(!msg.verify(), "user-info must be rejected in {msg:?}");
+        }
+    }
+
+    #[test]
+    fn test_bond_resolution_admin_actions_accept_payload_or_none() {
+        use crate::message::BondResolution;
+
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+
+        for action in [Action::AdminSettle, Action::AdminCancel] {
+            let with_resolution = Message::Order(MessageKind::new(
+                Some(uuid),
+                Some(1),
+                Some(2),
+                action.clone(),
+                Some(Payload::BondResolution(BondResolution {
+                    slash_seller: true,
+                    slash_buyer: false,
+                })),
+            ));
+            assert!(
+                with_resolution.verify(),
+                "{action:?} + BondResolution should verify"
+            );
+
+            let without_payload = Message::Order(MessageKind::new(
+                Some(uuid),
+                Some(1),
+                Some(2),
+                action.clone(),
+                None,
+            ));
+            assert!(without_payload.verify(), "{action:?} + None should verify");
+
+            // Wrong payload type must be rejected for these admin actions.
+            let wrong = Message::Order(MessageKind::new(
+                Some(uuid),
+                Some(1),
+                Some(2),
+                action.clone(),
+                Some(Payload::TextMessage("nope".to_string())),
+            ));
+            assert!(!wrong.verify(), "{action:?} + TextMessage must be rejected");
+
+            // Missing id is still invalid.
+            let no_id = Message::Order(MessageKind::new(
+                None,
+                Some(1),
+                Some(2),
+                action,
+                Some(Payload::BondResolution(BondResolution {
+                    slash_seller: false,
+                    slash_buyer: false,
+                })),
+            ));
+            assert!(!no_id.verify(), "admin action without id must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_bond_resolution_rejected_on_non_admin_actions() {
+        use crate::message::BondResolution;
+
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let payload = Payload::BondResolution(BondResolution {
+            slash_seller: true,
+            slash_buyer: true,
+        });
+
+        // Every Action except AdminSettle / AdminCancel must reject a
+        // BondResolution payload. Listed explicitly (no strum) so that adding
+        // a new Action variant forces a compile-error reminder here.
+        for action in [
+            Action::NewOrder,
+            Action::TakeSell,
+            Action::TakeBuy,
+            Action::PayInvoice,
+            Action::PayBondInvoice,
+            Action::FiatSent,
+            Action::FiatSentOk,
+            Action::Release,
+            Action::Released,
+            Action::Cancel,
+            Action::Canceled,
+            Action::CooperativeCancelInitiatedByYou,
+            Action::CooperativeCancelInitiatedByPeer,
+            Action::DisputeInitiatedByYou,
+            Action::DisputeInitiatedByPeer,
+            Action::CooperativeCancelAccepted,
+            Action::BuyerInvoiceAccepted,
+            Action::BondInvoiceAccepted,
+            Action::PurchaseCompleted,
+            Action::BondPayoutCompleted,
+            Action::BondSlashed,
+            Action::HoldInvoicePaymentAccepted,
+            Action::HoldInvoicePaymentSettled,
+            Action::HoldInvoicePaymentCanceled,
+            Action::WaitingSellerToPay,
+            Action::WaitingBuyerInvoice,
+            Action::AddInvoice,
+            Action::AddBondInvoice,
+            Action::BuyerTookOrder,
+            Action::Rate,
+            Action::RateUser,
+            Action::RateReceived,
+            Action::CantDo,
+            Action::Dispute,
+            Action::AdminCanceled,
+            Action::AdminSettled,
+            Action::AdminAddSolver,
+            Action::AdminTakeDispute,
+            Action::AdminTookDispute,
+            Action::PaymentFailed,
+            Action::InvoiceUpdated,
+            Action::SendDm,
+            Action::TradePubkey,
+            Action::RestoreSession,
+            Action::LastTradeIndex,
+            Action::UserInfo,
+            Action::Orders,
+        ] {
+            let msg = Message::Order(MessageKind::new(
+                Some(uuid),
+                Some(1),
+                Some(2),
+                action.clone(),
+                Some(payload.clone()),
+            ));
+            assert!(
+                !msg.verify(),
+                "{action:?} must reject BondResolution payload"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bond_resolution_wire_format() {
+        use crate::message::BondResolution;
+
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let msg = Message::Order(MessageKind::new(
+            Some(uuid),
+            None,
+            None,
+            Action::AdminCancel,
+            Some(Payload::BondResolution(BondResolution {
+                slash_seller: true,
+                slash_buyer: false,
+            })),
+        ));
+
+        let json = msg.as_json().unwrap();
+        // Variant discriminator must be the snake_case `bond_resolution`.
+        assert!(
+            json.contains("\"bond_resolution\""),
+            "expected snake_case discriminator, got: {json}"
+        );
+        assert!(json.contains("\"slash_seller\":true"));
+        assert!(json.contains("\"slash_buyer\":false"));
+
+        // Roundtrip preserves the variant.
+        let decoded = Message::from_json(&json).unwrap();
+        assert!(decoded.verify());
+        if let Message::Order(kind) = decoded {
+            match kind.payload {
+                Some(Payload::BondResolution(b)) => {
+                    assert!(b.slash_seller);
+                    assert!(!b.slash_buyer);
+                }
+                other => panic!("expected BondResolution payload, got {other:?}"),
+            }
+        } else {
+            panic!("expected Order message");
+        }
+    }
+
+    #[test]
+    fn test_bond_resolution_legacy_null_payload() {
+        // payload = null on AdminSettle/AdminCancel must keep verifying so
+        // pre-BondResolution clients keep working (interpreted as "no slash"
+        // by the server).
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let json = format!(
+            r#"{{"order":{{"version":1,"id":"{uuid}","action":"admin-cancel","payload":null}}}}"#
+        );
+        let msg = Message::from_json(&json).unwrap();
+        assert!(msg.verify());
+    }
+
+    #[test]
+    fn test_pay_bond_invoice_wire_format_and_verify() {
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let bolt11 = "lnbcrt78510n1pj59wmepp50677g8tffdqa2p8882y0x6newny5vtz0hjuyngdwv226nanv4uzsdqqcqzzsxqyz5vqsp5skn973360gp4yhlpmefwvul5hs58lkkl3u3ujvt57elmp4zugp4q9qyyssqw4nzlr72w28k4waycf27qvgzc9sp79sqlw83j56txltz4va44j7jda23ydcujj9y5k6k0rn5ms84w8wmcmcyk5g3mhpqepf7envhdccp72nz6e".to_string();
+
+        let msg = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::PayBondInvoice,
+            Some(Payload::PaymentRequest(None, bolt11.clone(), None)),
+        ));
+        assert!(msg.verify());
+
+        // Wire format must use the kebab-case discriminator.
+        let json = msg.as_json().unwrap();
+        assert!(
+            json.contains("\"action\":\"pay-bond-invoice\""),
+            "expected kebab-case discriminator, got: {json}"
+        );
+
+        // Roundtrip preserves the variant.
+        let decoded = Message::from_json(&json).unwrap();
+        assert!(decoded.verify());
+        assert!(matches!(
+            decoded.inner_action(),
+            Some(Action::PayBondInvoice)
+        ));
+
+        // Same id / payload constraints as PayInvoice: missing id is invalid.
+        let no_id = Message::Order(MessageKind::new(
+            None,
+            Some(1),
+            Some(2),
+            Action::PayBondInvoice,
+            Some(Payload::PaymentRequest(None, bolt11.clone(), None)),
+        ));
+        assert!(!no_id.verify());
+
+        // Wrong payload shape is rejected.
+        let wrong_payload = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::PayBondInvoice,
+            Some(Payload::TextMessage("nope".to_string())),
+        ));
+        assert!(!wrong_payload.verify());
+
+        // Missing payload is rejected (PaymentRequest is required).
+        let no_payload = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::PayBondInvoice,
+            None,
+        ));
+        assert!(!no_payload.verify());
+    }
+
+    #[test]
+    fn test_add_bond_invoice_wire_format_and_verify() {
+        let uuid = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let bolt11 = "lnbcrt78510n1pj59wmepp50677g8tffdqa2p8882y0x6newny5vtz0hjuyngdwv226nanv4uzsdqqcqzzsxqyz5vqsp5skn973360gp4yhlpmefwvul5hs58lkkl3u3ujvt57elmp4zugp4q9qyyssqw4nzlr72w28k4waycf27qvgzc9sp79sqlw83j56txltz4va44j7jda23ydcujj9y5k6k0rn5ms84w8wmcmcyk5g3mhpqepf7envhdccp72nz6e".to_string();
+
+        let msg = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::AddBondInvoice,
+            Some(Payload::PaymentRequest(None, bolt11.clone(), None)),
+        ));
+        assert!(msg.verify());
+
+        // Wire format must use the kebab-case discriminator.
+        let json = msg.as_json().unwrap();
+        assert!(
+            json.contains("\"action\":\"add-bond-invoice\""),
+            "expected kebab-case discriminator, got: {json}"
+        );
+
+        // Roundtrip preserves the variant.
+        let decoded = Message::from_json(&json).unwrap();
+        assert!(decoded.verify());
+        assert!(matches!(
+            decoded.inner_action(),
+            Some(Action::AddBondInvoice)
+        ));
+
+        // Same id / payload constraints as AddInvoice: missing id is invalid.
+        let no_id = Message::Order(MessageKind::new(
+            None,
+            Some(1),
+            Some(2),
+            Action::AddBondInvoice,
+            Some(Payload::PaymentRequest(None, bolt11.clone(), None)),
+        ));
+        assert!(!no_id.verify());
+
+        // Wrong payload shape is rejected.
+        let wrong_payload = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::AddBondInvoice,
+            Some(Payload::TextMessage("nope".to_string())),
+        ));
+        assert!(!wrong_payload.verify());
+
+        // Missing payload is rejected (PaymentRequest is required).
+        let no_payload = Message::Order(MessageKind::new(
+            Some(uuid),
+            Some(1),
+            Some(2),
+            Action::AddBondInvoice,
+            None,
+        ));
+        assert!(!no_payload.verify());
+
+        // get_payment_request must surface the bolt11 for AddBondInvoice.
+        if let Message::Order(kind) = &msg {
+            assert_eq!(kind.get_payment_request(), Some(bolt11));
+        } else {
+            panic!("expected Message::Order");
+        }
+    }
+
+    #[test]
+    fn test_restored_dispute_helper_serialization_roundtrip() {
+        use crate::message::RestoredDisputeHelper;
+
+        let helper = RestoredDisputeHelper {
+            dispute_id: uuid!("508e1272-d5f4-47e6-bd97-3504baea9c25"),
+            order_id: uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23"),
+            dispute_status: "initiated".to_string(),
+            master_buyer_pubkey: Some("npub1buyerkey".to_string()),
+            master_seller_pubkey: Some("npub1sellerkey".to_string()),
+            trade_index_buyer: Some(1),
+            trade_index_seller: Some(2),
+            buyer_dispute: true,
+            seller_dispute: false,
+            solver_pubkey: None,
+        };
+
+        let json = serde_json::to_string(&helper).unwrap();
+        let deserialized: RestoredDisputeHelper = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.dispute_id, helper.dispute_id);
+        assert_eq!(deserialized.order_id, helper.order_id);
+        assert_eq!(deserialized.dispute_status, helper.dispute_status);
+        assert_eq!(deserialized.master_buyer_pubkey, helper.master_buyer_pubkey);
+        assert_eq!(
+            deserialized.master_seller_pubkey,
+            helper.master_seller_pubkey
+        );
+        assert_eq!(deserialized.trade_index_buyer, helper.trade_index_buyer);
+        assert_eq!(deserialized.trade_index_seller, helper.trade_index_seller);
+        assert_eq!(deserialized.buyer_dispute, helper.buyer_dispute);
+        assert_eq!(deserialized.seller_dispute, helper.seller_dispute);
+        assert_eq!(deserialized.solver_pubkey, helper.solver_pubkey);
+
+        let helper_seller_dispute = RestoredDisputeHelper {
+            dispute_id: uuid!("608e1272-d5f4-47e6-bd97-3504baea9c26"),
+            order_id: uuid!("408e1272-d5f4-47e6-bd97-3504baea9c24"),
+            dispute_status: "in-progress".to_string(),
+            master_buyer_pubkey: None,
+            master_seller_pubkey: None,
+            trade_index_buyer: None,
+            trade_index_seller: None,
+            buyer_dispute: false,
+            seller_dispute: true,
+            solver_pubkey: Some(
+                "aabbccdd11223344aabbccdd11223344aabbccdd11223344aabbccdd11223344".to_string(),
+            ),
+        };
+
+        let json_seller = serde_json::to_string(&helper_seller_dispute).unwrap();
+        let deserialized_seller: RestoredDisputeHelper =
+            serde_json::from_str(&json_seller).unwrap();
+
+        assert_eq!(
+            deserialized_seller.dispute_id,
+            helper_seller_dispute.dispute_id
+        );
+        assert_eq!(deserialized_seller.order_id, helper_seller_dispute.order_id);
+        assert_eq!(
+            deserialized_seller.dispute_status,
+            helper_seller_dispute.dispute_status
+        );
+        assert_eq!(deserialized_seller.master_buyer_pubkey, None);
+        assert_eq!(deserialized_seller.master_seller_pubkey, None);
+        assert_eq!(deserialized_seller.trade_index_buyer, None);
+        assert_eq!(deserialized_seller.trade_index_seller, None);
+        assert!(!deserialized_seller.buyer_dispute);
+        assert!(deserialized_seller.seller_dispute);
+        assert_eq!(
+            deserialized_seller.solver_pubkey,
+            helper_seller_dispute.solver_pubkey
+        );
+    }
+
+    fn sample_lock_proof() -> CashuLockProof {
+        CashuLockProof::new(
+            "cashuAeyJ0b2tlbiI6dGVzdA".to_string(),
+            "https://mint.example".to_string(),
+            "02b_buyer".to_string(),
+            "02s_seller".to_string(),
+            "02m_mostro".to_string(),
+        )
+    }
+
+    #[test]
+    fn test_cashu_lock_proof_json_round_trip() {
+        let proof = sample_lock_proof();
+        let json = proof.as_json().unwrap();
+        let back = CashuLockProof::from_json(&json).unwrap();
+        assert_eq!(back, proof);
+    }
+
+    #[test]
+    fn test_cashu_lock_proof_fee_token_round_trip() {
+        let proof = sample_lock_proof().with_fee_token("cashuAfee".to_string());
+        let json = proof.as_json().unwrap();
+        assert!(json.contains("fee_token"));
+        let back = CashuLockProof::from_json(&json).unwrap();
+        assert_eq!(back, proof);
+        assert_eq!(back.fee_token.as_deref(), Some("cashuAfee"));
+    }
+
+    #[test]
+    fn test_cashu_lock_proof_without_fee_token_is_omitted_and_defaults_to_none() {
+        // A proof with no fee serializes without the key (wire-compatible with
+        // clients that predate the field) and parses back to `None`.
+        let proof = sample_lock_proof();
+        assert_eq!(proof.fee_token, None);
+        let json = proof.as_json().unwrap();
+        assert!(!json.contains("fee_token"));
+        let back = CashuLockProof::from_json(&json).unwrap();
+        assert_eq!(back.fee_token, None);
+    }
+
+    #[test]
+    fn test_add_cashu_escrow_verifies_with_lock_proof() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let payload = Payload::CashuLockProof(sample_lock_proof());
+        let kind = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::AddCashuEscrow,
+            Some(payload),
+        );
+        assert!(
+            kind.verify(),
+            "CashuLockProof must verify on AddCashuEscrow"
+        );
+
+        // Round-trip through JSON to catch a serde-rename mismatch on the
+        // new snake_case discriminator.
+        let json = Message::Order(kind).as_json().unwrap();
+        assert!(json.contains("cashu_lock_proof"));
+        assert!(Message::from_json(&json).unwrap().verify());
+    }
+
+    #[test]
+    fn test_add_cashu_escrow_requires_id_and_right_payload() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+
+        // Missing id ⇒ invalid.
+        let no_id = MessageKind::new(
+            None,
+            None,
+            None,
+            Action::AddCashuEscrow,
+            Some(Payload::CashuLockProof(sample_lock_proof())),
+        );
+        assert!(
+            !no_id.verify(),
+            "AddCashuEscrow without id must be rejected"
+        );
+
+        // Wrong payload ⇒ invalid.
+        let wrong_payload = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::AddCashuEscrow,
+            Some(Payload::TextMessage("not a lock proof".to_string())),
+        );
+        assert!(
+            !wrong_payload.verify(),
+            "AddCashuEscrow with non-lock-proof payload must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_cashu_pm_signature_verifies_with_signatures() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let kind = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::CashuPmSignature,
+            Some(Payload::CashuSignatures(vec![
+                CashuProofSignature::new("secret-0".to_string(), "deadbeef".to_string()),
+                CashuProofSignature::new("secret-1".to_string(), "c0ffee".to_string()),
+            ])),
+        );
+        assert!(
+            kind.verify(),
+            "CashuSignatures must verify on CashuPmSignature"
+        );
+
+        let json = Message::Order(kind).as_json().unwrap();
+        assert!(json.contains("cashu_signatures"));
+        assert!(Message::from_json(&json).unwrap().verify());
+
+        // Wrong payload ⇒ invalid.
+        let wrong = MessageKind::new(Some(order_id), None, None, Action::CashuPmSignature, None);
+        assert!(
+            !wrong.verify(),
+            "CashuPmSignature without a signature payload must be rejected"
+        );
+
+        // Empty signature set ⇒ invalid: a multi-proof escrow needs one
+        // signature per proof, so an empty collection cannot assemble a swap.
+        let empty = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::CashuPmSignature,
+            Some(Payload::CashuSignatures(vec![])),
+        );
+        assert!(
+            !empty.verify(),
+            "CashuPmSignature with an empty signature set must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_cashu_escrow_locked_is_informational() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+
+        // Informational ack with an id and no payload verifies.
+        let ok = MessageKind::new(Some(order_id), None, None, Action::CashuEscrowLocked, None);
+        assert!(ok.verify(), "CashuEscrowLocked with id must verify");
+
+        // Missing id ⇒ invalid.
+        let no_id = MessageKind::new(None, None, None, Action::CashuEscrowLocked, None);
+        assert!(
+            !no_id.verify(),
+            "CashuEscrowLocked without id must be rejected"
+        );
+    }
+
+    fn sample_declaration() -> PayerDeclaration {
+        PayerDeclaration::new(payment_hash("EU|SEPA|DE89370400440532013000|ALICE SMITH"))
+    }
+
+    fn sample_history() -> PaymentHistory {
+        PaymentHistory {
+            payment_hash: sample_declaration().payment_hash,
+            buyer_mode: BuyerMode::Reputation,
+            successful_trades: 47,
+            distinct_counterparties: 29,
+            experienced_counterparties: 11,
+            first_success_at: Some(1_762_128_000),
+            last_success_at: Some(1_787_654_321),
+        }
+    }
+
+    #[test]
+    fn test_payer_history_actions_use_kebab_case_wire_names() {
+        for (action, wire) in [
+            (Action::DeclarePayer, "\"declare-payer\""),
+            (Action::PayerDeclared, "\"payer-declared\""),
+            (Action::PaymentHistory, "\"payment-history\""),
+        ] {
+            assert_eq!(serde_json::to_string(&action).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<Action>(wire).unwrap(), action);
+        }
+    }
+
+    #[test]
+    fn test_declare_payer_requires_id_and_declaration() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let decl = Some(Payload::PayerDeclaration(sample_declaration()));
+
+        let ok = MessageKind::new(
+            Some(order_id),
+            Some(1),
+            Some(7),
+            Action::DeclarePayer,
+            decl.clone(),
+        );
+        assert!(
+            ok.verify(),
+            "DeclarePayer with id and declaration must verify"
+        );
+
+        let no_id = MessageKind::new(None, None, None, Action::DeclarePayer, decl);
+        assert!(!no_id.verify(), "DeclarePayer without id must be rejected");
+
+        let no_payload = MessageKind::new(Some(order_id), None, None, Action::DeclarePayer, None);
+        assert!(
+            !no_payload.verify(),
+            "DeclarePayer without payload must be rejected"
+        );
+
+        let wrong = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::DeclarePayer,
+            Some(Payload::TextMessage(
+                "plaintext must never be sent".to_string(),
+            )),
+        );
+        assert!(
+            !wrong.verify(),
+            "DeclarePayer with a non-declaration payload must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_payer_declared_requires_id_and_declaration() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let decl = Some(Payload::PayerDeclaration(sample_declaration()));
+
+        let ok = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::PayerDeclared,
+            decl.clone(),
+        );
+        assert!(
+            ok.verify(),
+            "PayerDeclared with id and declaration must verify"
+        );
+
+        let no_id = MessageKind::new(None, None, None, Action::PayerDeclared, decl);
+        assert!(!no_id.verify(), "PayerDeclared without id must be rejected");
+
+        let no_payload = MessageKind::new(Some(order_id), None, None, Action::PayerDeclared, None);
+        assert!(
+            !no_payload.verify(),
+            "PayerDeclared without payload must be rejected"
+        );
+
+        let wrong = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::PayerDeclared,
+            Some(Payload::PaymentHistory(sample_history())),
+        );
+        assert!(
+            !wrong.verify(),
+            "PayerDeclared with a history payload must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_payment_history_accepts_query_and_reply_shapes() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+
+        // Seller → Mostro query: no payload.
+        let query = MessageKind::new(Some(order_id), Some(3), None, Action::PaymentHistory, None);
+        assert!(
+            query.verify(),
+            "PaymentHistory query (no payload) must verify"
+        );
+
+        // Mostro → seller push / reply: the aggregate history.
+        let reply = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::PaymentHistory,
+            Some(Payload::PaymentHistory(sample_history())),
+        );
+        assert!(reply.verify(), "PaymentHistory reply must verify");
+
+        let no_id = MessageKind::new(None, None, None, Action::PaymentHistory, None);
+        assert!(
+            !no_id.verify(),
+            "PaymentHistory without id must be rejected"
+        );
+
+        let wrong = MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::PaymentHistory,
+            Some(Payload::PayerDeclaration(sample_declaration())),
+        );
+        assert!(
+            !wrong.verify(),
+            "PaymentHistory with a declaration payload must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_payer_payloads_round_trip_with_snake_case_keys() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+
+        let declare = Message::Order(MessageKind::new(
+            Some(order_id),
+            Some(981_231),
+            Some(7),
+            Action::DeclarePayer,
+            Some(Payload::PayerDeclaration(sample_declaration())),
+        ));
+        let json = declare.as_json().unwrap();
+        assert!(json.contains("\"action\":\"declare-payer\""));
+        assert!(json.contains("\"payer_declaration\":{\"payment_hash\":"));
+        assert!(Message::from_json(&json).unwrap().verify());
+
+        let push = Message::Order(MessageKind::new(
+            Some(order_id),
+            None,
+            None,
+            Action::PaymentHistory,
+            Some(Payload::PaymentHistory(sample_history())),
+        ));
+        let json = push.as_json().unwrap();
+        assert!(json.contains("\"payment_history\":{"));
+        assert!(json.contains("\"buyer_mode\":\"reputation\""));
+        assert!(json.contains("\"experienced_counterparties\":11"));
+        let back = Message::from_json(&json).unwrap();
+        assert!(back.verify());
+        match back.get_inner_message_kind().payload.clone() {
+            Some(Payload::PaymentHistory(h)) => assert_eq!(h, sample_history()),
+            other => panic!("expected a PaymentHistory payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_payment_history_parses_the_protocol_wire_example() {
+        // The full-privacy example from the protocol chapter, verbatim apart
+        // from the elided hash.
+        let hash = sample_declaration().payment_hash;
+        let json = format!(
+            r#"{{"payment_history": {{"payment_hash": "{hash}", "buyer_mode": "full_privacy",
+              "successful_trades": 0, "distinct_counterparties": 0,
+              "experienced_counterparties": 0,
+              "first_success_at": null, "last_success_at": null}}}}"#
+        );
+        let payload: Payload = serde_json::from_str(&json).unwrap();
+        match payload {
+            Payload::PaymentHistory(h) => assert_eq!(h, PaymentHistory::unavailable(hash)),
+            other => panic!("expected a PaymentHistory payload, got {other:?}"),
+        }
+    }
+
+    /// The wire shapes the protocol's reputation chapter documents: the
+    /// `order` wrapper, no `id`, kebab-case actions and snake_case payloads.
+    #[test]
+    fn reputation_messages_have_the_documented_wire_shape() {
+        let export = Message::new_order(
+            None,
+            Some(4126),
+            None,
+            Action::ExportReputation,
+            Some(Payload::ReputationExportRequest(
+                super::ReputationExportRequest {
+                    destination: "ab".repeat(32),
+                    rebind: None,
+                },
+            )),
+        );
+        let json: serde_json::Value = serde_json::from_str(&export.as_json().unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "order": {
+                "version": 2,
+                "request_id": 4126,
+                "trade_index": null,
+                "action": "export-reputation",
+                "payload": { "reputation_export_request": {
+                    "destination": "ab".repeat(32),
+                    "rebind": null,
+                }},
+            }})
+        );
+
+        for (action, wire) in [
+            (Action::ReputationExported, "reputation-exported"),
+            (Action::ImportReputation, "import-reputation"),
+        ] {
+            let message = Message::new_order(
+                None,
+                None,
+                None,
+                action,
+                Some(Payload::ReputationAttestation("{}".into())),
+            );
+            let json: serde_json::Value =
+                serde_json::from_str(&message.as_json().unwrap()).unwrap();
+            assert_eq!(json["order"]["action"], wire);
+            assert_eq!(json["order"]["payload"]["reputation_attestation"], "{}");
+        }
+
+        let imported = Message::new_order(None, None, None, Action::ReputationImported, None);
+        let json: serde_json::Value = serde_json::from_str(&imported.as_json().unwrap()).unwrap();
+        assert_eq!(json["order"]["action"], "reputation-imported");
+        assert!(json["order"]["payload"].is_null());
+    }
+
+    #[test]
+    fn an_export_request_without_rebind_deserialises() {
+        let json = r#"{"order":{"version":2,"action":"export-reputation","payload":{"reputation_export_request":{"destination":"ab"}}}}"#;
+        let message = Message::from_json(json).unwrap();
+        let kind = message.get_inner_message_kind();
+        match &kind.payload {
+            Some(Payload::ReputationExportRequest(request)) => assert_eq!(request.rebind, None),
+            other => panic!("unexpected payload {other:?}"),
+        }
+        assert!(kind.verify());
+    }
+
+    #[test]
+    fn reputation_actions_verify_only_without_an_id_and_with_their_payload() {
+        let order_id = uuid!("308e1272-d5f4-47e6-bd97-3504baea9c23");
+        let request = Payload::ReputationExportRequest(super::ReputationExportRequest {
+            destination: "ab".repeat(32),
+            rebind: None,
+        });
+        let attestation = Payload::ReputationAttestation("{}".into());
+        let cases = [
+            (Action::ExportReputation, Some(request.clone()), true),
+            (Action::ExportReputation, Some(attestation.clone()), false),
+            (Action::ExportReputation, None, false),
+            (Action::ReputationExported, Some(attestation.clone()), true),
+            (Action::ReputationExported, None, false),
+            (Action::ImportReputation, Some(attestation.clone()), true),
+            (Action::ImportReputation, Some(request.clone()), false),
+            (Action::ReputationImported, None, true),
+            (Action::ReputationImported, Some(attestation.clone()), false),
+        ];
+        for (action, payload, ok) in cases {
+            let without_id = MessageKind::new(None, None, None, action.clone(), payload.clone());
+            assert_eq!(without_id.verify(), ok, "{action:?} {payload:?}");
+            let with_id = MessageKind::new(Some(order_id), None, None, action.clone(), payload);
+            assert!(!with_id.verify(), "{action:?} must not carry an id");
+        }
+    }
+
+    /// `PROTOCOL_VER` stays 2: the reputation actions are request/response
+    /// over encrypted direct messages, so an old client never sends them and
+    /// is never sent their replies, and a new client only sends them to a
+    /// node whose info event advertises them. Nothing about them is
+    /// broadcast. A new `cant-do` reason reaching an old client degrades to
+    /// `Unknown` through `CantDoReason`'s catch-all.
+    #[test]
+    fn reputation_messages_keep_protocol_version_2() {
+        for action in [
+            Action::ExportReputation,
+            Action::ReputationExported,
+            Action::ImportReputation,
+            Action::ReputationImported,
+        ] {
+            assert_eq!(MessageKind::new(None, None, None, action, None).version, 2);
+        }
+    }
+}

@@ -1043,6 +1043,82 @@ impl Default for RpcSettings {
     }
 }
 
+/// Telegram notifications (read-only, v1).
+///
+/// Opt-in. An absent `[telegram]` block or `enabled = false` (the default)
+/// keeps every Telegram code path inert — the daemon behaves exactly as
+/// before. Notifications are strictly read-only: the bot never accepts trade
+/// commands (no release / cancel / inline buttons) because a compromised
+/// Telegram account must not be able to move funds.
+///
+/// The bot token is never read from or written to `settings.toml`: it is
+/// loaded from the environment variable named by `bot_token_env` at startup
+/// (like `MOSTRO_NSEC_PRIVKEY`), and the daemon refuses to start with the
+/// section enabled but the token unset or blank.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TelegramSettings {
+    /// Master switch. When false, no polling task runs and no notification is
+    /// ever sent.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Environment variable holding the bot token.
+    #[serde(default = "default_telegram_bot_token_env")]
+    pub bot_token_env: String,
+    /// Base URL of the Telegram Bot API. Overridable so tests and operators
+    /// behind a proxy can point the client elsewhere.
+    #[serde(default = "default_telegram_api_base_url")]
+    pub api_base_url: String,
+    /// `getUpdates` long-polling timeout, in seconds (Telegram caps this at
+    /// 50; the client clamps it).
+    #[serde(default = "default_telegram_polling_timeout")]
+    pub polling_timeout_seconds: u64,
+    /// Seconds to sleep after a failed poll before retrying.
+    #[serde(default = "default_telegram_poll_retry_seconds")]
+    pub poll_retry_seconds: u64,
+    /// How long (seconds) a one-time linking code stays valid.
+    #[serde(default = "default_telegram_link_code_ttl_seconds")]
+    pub link_code_ttl_seconds: u64,
+    /// The loaded bot token (from `bot_token_env`). Never serialized back to
+    /// disk; `None` until startup loads it.
+    #[serde(skip)]
+    pub bot_token: Option<secrecy::SecretString>,
+}
+
+fn default_telegram_bot_token_env() -> String {
+    "TELEGRAM_BOT_TOKEN".to_string()
+}
+
+fn default_telegram_api_base_url() -> String {
+    "https://api.telegram.org".to_string()
+}
+
+fn default_telegram_polling_timeout() -> u64 {
+    30
+}
+
+fn default_telegram_poll_retry_seconds() -> u64 {
+    5
+}
+
+fn default_telegram_link_code_ttl_seconds() -> u64 {
+    900
+}
+
+impl Default for TelegramSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token_env: default_telegram_bot_token_env(),
+            api_base_url: default_telegram_api_base_url(),
+            polling_timeout_seconds: default_telegram_polling_timeout(),
+            poll_retry_seconds: default_telegram_poll_retry_seconds(),
+            link_code_ttl_seconds: default_telegram_link_code_ttl_seconds(),
+            bot_token: None,
+        }
+    }
+}
+
 /// Mostro configuration settings
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

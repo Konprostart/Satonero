@@ -4,7 +4,7 @@ use crate::config::secret::take_nsec_for_init;
 use crate::config::types::{
     AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
     HealthSettings, LightningSettings, MostroSettings, NostrSettings, ReputationExportSettings,
-    ReputationImportSettings, RpcSettings,
+    ReputationImportSettings, RpcSettings, TelegramSettings,
 };
 use crate::price::PriceSettings;
 use mostro_core::error::MostroError::{self, *};
@@ -58,12 +58,16 @@ pub struct Settings {
     /// section ≡ disabled.
     #[serde(default)]
     pub reputation_export: Option<ReputationExportSettings>,
+    /// Telegram read-only notifications. Absent section ≡ disabled.
+    #[serde(default)]
+    pub telegram: Option<TelegramSettings>,
 }
 
 /// Initialize the global `MOSTRO_CONFIG` and `NOSTR_KEYS` structs.
 pub fn init_mostro_settings(mut s: Settings) -> Result<(), MostroError> {
     let keys = take_nsec_for_init(&mut s.nostr)?;
     attach_reputation_issuer_keys(&mut s, &keys)?;
+    attach_telegram_bot_token(&mut s)?;
     NOSTR_KEYS.set(keys).map_err(|_| {
         MostroInternalErr(ServiceError::IOError(
             "Mostro nostr keys already initialized".to_string(),
@@ -109,6 +113,30 @@ pub(crate) fn attach_reputation_issuer_keys(
         );
     }
     export.issuer_keys = Some(issuer);
+    Ok(())
+}
+
+/// Load the Telegram bot token when the `[telegram]` section is enabled: from
+/// the environment variable the section names, never from `settings.toml`.
+/// Unset or blank while enabled stops the boot; a disabled section needs no
+/// token and keeps `bot_token` `None`.
+pub(crate) fn attach_telegram_bot_token(s: &mut Settings) -> Result<(), MostroError> {
+    let Some(telegram) = s.telegram.as_mut().filter(|t| t.enabled) else {
+        return Ok(());
+    };
+    let fail = |reason: String| {
+        Err(MostroInternalErr(ServiceError::IOError(format!(
+            "[telegram] {reason}"
+        ))))
+    };
+    let Ok(raw) = std::env::var(&telegram.bot_token_env) else {
+        return fail(format!("enabled but {} is not set", telegram.bot_token_env));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return fail(format!("enabled but {} is empty", telegram.bot_token_env));
+    }
+    telegram.bot_token = Some(secrecy::SecretString::from(trimmed.to_owned()));
     Ok(())
 }
 
@@ -313,6 +341,21 @@ impl Settings {
         } else {
             EscrowMode::Lightning
         }
+    }
+
+    /// The `[telegram]` configuration from the global `MOSTRO_CONFIG`.
+    /// Returns `None` when the block is absent (treated as disabled) and also
+    /// when the global settings haven't been initialized yet, mirroring
+    /// [`Settings::get_bond`].
+    pub fn get_telegram() -> Option<&'static TelegramSettings> {
+        MOSTRO_CONFIG.get()?.telegram.as_ref()
+    }
+
+    /// True when `[telegram]` is present AND explicitly enabled. The single
+    /// gate every Telegram code path must check. Returns `false` when
+    /// settings haven't been initialized.
+    pub fn is_telegram_enabled() -> bool {
+        Self::get_telegram().is_some_and(|cfg| cfg.enabled)
     }
 }
 

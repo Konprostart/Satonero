@@ -61,6 +61,7 @@ use crate::db::add_new_user;
 use crate::db::is_user_present;
 use crate::lightning::LndConnector;
 use crate::spam_gate::SpamGate;
+use crate::telegram::request_telegram_code_action;
 use crate::util::enqueue_cant_do_msg;
 use crate::Result;
 
@@ -247,6 +248,13 @@ async fn handle_message_action_no_ln(
             .await
             .map_err(|e| e.into()),
         Action::UserInfo => user_info(ctx, msg, event, my_keys)
+            .await
+            .map_err(|e| e.into()),
+
+        // Telegram account linking (read-only): mint a one-time code the user
+        // activates with `/start <code>`. Refused with `InvalidAction` when
+        // `[telegram]` is disabled.
+        Action::RequestTelegramCode => request_telegram_code_action(ctx, msg, event, my_keys)
             .await
             .map_err(|e| e.into()),
 
@@ -734,6 +742,7 @@ async fn dispatch_cashu(
         | Action::LastTradeIndex
         | Action::UserInfo
         | Action::RestoreSession
+        | Action::RequestTelegramCode
         | Action::TradePubkey => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }

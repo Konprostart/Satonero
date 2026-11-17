@@ -442,3 +442,24 @@ lnd_resynced_clear_after = 300
 # # attestation cannot carry more, and destinations cap it at 7 days by
 # # default.
 # lifetime_seconds = 604800
+
+# Telegram read-only notifications (v1). Opt-in, disabled by default. Sends
+# buy/sell/escrow order-transition notifications to users who linked their
+# Telegram account. READ-ONLY ONLY: the bot never accepts trade commands
+# (release / cancel / inline buttons) so a compromised Telegram account cannot
+# move funds. The bot token is never stored here — it is read from the
+# environment variable named below (also from <settings dir>/.env), and the
+# daemon refuses to start with the section enabled but the token unset.
+#
+# [telegram]
+# enabled = false
+# # Environment variable holding the bot token.
+# bot_token_env = "TELEGRAM_BOT_TOKEN"
+# # Telegram Bot API base URL (override for tests/proxies).
+# api_base_url = "https://api.telegram.org"
+# # getUpdates long-polling timeout, in seconds (1..=50).
+# polling_timeout_seconds = 30
+# # Seconds to sleep after a failed poll before retrying.
+# poll_retry_seconds = 5
+# # How long (seconds) a one-time linking code stays valid.
+# link_code_ttl_seconds = 900

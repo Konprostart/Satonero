@@ -15,6 +15,7 @@ pub mod publish;
 pub mod rpc;
 pub mod scheduler;
 pub mod spam_gate;
+pub mod telegram;
 pub mod util;
 
 /// Convenience alias mirroring the one `nostr` (pre-0.45) used to re-export
@@ -284,6 +285,10 @@ async fn main() -> Result<()> {
 
         start_scheduler(ctx.clone()).await;
 
+        // Telegram read-only notifications (v1): long-poll getUpdates and
+        // handle `/start <code>`. No-op when `[telegram]` is disabled.
+        crate::telegram::start_polling(get_db_pool()).await;
+
         // Run the Mostro Cashu event loop and be happy!!
         return run_cashu(ctx).await;
     }
@@ -484,6 +489,10 @@ async fn main() -> Result<()> {
 
     // Start scheduler for tasks
     start_scheduler(ctx.clone()).await;
+
+    // Telegram read-only notifications (v1): long-poll getUpdates and handle
+    // `/start <code>`. No-op when `[telegram]` is disabled.
+    crate::telegram::start_polling(get_db_pool()).await;
 
     // Run the Mostro and be happy!!
     run(ctx, &mut ln_client).await
