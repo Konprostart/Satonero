@@ -598,14 +598,21 @@ pub fn verify_escrow_conditions(
                 conditions: Some(c),
                 ..
             }) => c,
-            // verify_2of3_condition already guaranteed P2PK-with-tags.
-            _ => unreachable!("verify_2of3_condition accepted a non-P2PK secret"),
+            // `verify_2of3_condition` should already have guaranteed
+            // P2PK-with-tags, but this is an attacker-supplied token: a gap
+            // in that verifier must reject here, never panic the daemon.
+            _ => {
+                return Err(Error::Condition(
+                    "escrow token secret is not a P2PK condition".to_string(),
+                ))
+            }
         };
-        // Presence already enforced by verify_2of3_condition; here we
-        // enforce the floor.
-        let locktime = conditions
-            .locktime
-            .expect("verify_2of3_condition requires a locktime");
+        // Presence should already be enforced by `verify_2of3_condition`;
+        // here we enforce the floor. Reject a missing locktime instead of
+        // panicking on a malformed attacker-supplied token.
+        let locktime = conditions.locktime.ok_or_else(|| {
+            Error::Condition("escrow token P2PK condition has no locktime".to_string())
+        })?;
         if locktime < min_locktime {
             return Err(Error::Condition(format!(
                 "locktime {locktime} is below the required floor {min_locktime}"

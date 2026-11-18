@@ -46,8 +46,9 @@ use util::{get_nostr_client, invoice_subscribe};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Clear screen
-    clearscreen::clear().expect("Failed to clear screen");
+    // Clear screen. Best-effort: under a non-TTY supervisor (systemd, a dumb
+    // terminal) clearing fails, and that must not abort startup.
+    let _ = clearscreen::clear();
 
     if cfg!(debug_assertions) {
         // Debug, show all error + mostro logs

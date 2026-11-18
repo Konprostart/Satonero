@@ -142,7 +142,7 @@ impl PriceStore {
         if aggregates.is_empty() {
             return dropped;
         }
-        let mut w = self.inner.write().expect("price store lock poisoned");
+        let mut w = self.inner.write().unwrap_or_else(|e| e.into_inner());
         for (currency, agg) in aggregates {
             let key = currency.to_uppercase();
             // Defer to the stored stamp only when our own clock could still
@@ -190,7 +190,7 @@ impl PriceStore {
     /// [`Self::update_observed`]'s guard leaves a **fresher** value in place,
     /// so that currency is still servable. Only the stored entry knows.
     pub fn servable_count(&self, max_staleness_secs: i64, now: i64) -> usize {
-        let r = self.inner.read().expect("price store lock poisoned");
+        let r = self.inner.read().unwrap_or_else(|e| e.into_inner());
         r.values()
             .filter(|e| now.saturating_sub(e.as_of) <= max_staleness_secs)
             .count()
@@ -209,7 +209,7 @@ impl PriceStore {
         max_staleness_secs: i64,
         now: i64,
     ) -> Result<f64, PriceError> {
-        let r = self.inner.read().expect("price store lock poisoned");
+        let r = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let entry = r
             .get(&currency.to_uppercase())
             .ok_or(PriceError::NoCurrency)?;
@@ -223,7 +223,7 @@ impl PriceStore {
     /// Snapshot of a currency's full entry (for observability / Nostr
     /// publishing in later phases). No staleness filtering.
     pub fn snapshot(&self, currency: &str) -> Option<AggregatedPrice> {
-        let r = self.inner.read().expect("price store lock poisoned");
+        let r = self.inner.read().unwrap_or_else(|e| e.into_inner());
         r.get(&currency.to_uppercase()).copied()
     }
 }

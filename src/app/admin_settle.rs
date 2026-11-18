@@ -137,9 +137,14 @@ pub async fn admin_settle_action(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if result.rows_affected() == 0 {
-        tracing::warn!(
-            "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
-            order_updated.id
+        // The escrow hold invoice was already settled above; a CAS miss means
+        // the dispute/order moved on concurrently while the settle was in
+        // flight. The funds are released but the buyer payout and dispute
+        // finalization are skipped — surface loudly for reconciliation.
+        tracing::error!(
+            order_id = %order_updated.id,
+            "admin_settle: escrow settled but order not advanced to settled-hold-invoice \
+             (status changed concurrently); dispute/buyer payout skipped — reconcile manually"
         );
         return Ok(());
     }
@@ -258,7 +263,16 @@ pub async fn admin_settle_action(
         );
     }
 
-    let _ = do_payment(ctx, order_updated, request_id).await;
+    let order_id = order_updated.id;
+    if let Err(e) = do_payment(ctx, order_updated, request_id).await {
+        // The failure is recorded durably for the payout retry job, but it
+        // must still be visible here: a silent swallow hides a payout that
+        // needs the retry path to fire.
+        tracing::warn!(
+            order_id = %order_id,
+            "admin_settle: buyer payout failed (queued for retry): {}", e
+        );
+    }
 
     Ok(())
 }

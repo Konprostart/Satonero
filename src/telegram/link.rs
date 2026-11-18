@@ -10,7 +10,7 @@
 use crate::app::context::AppContext;
 use crate::config::Settings;
 use crate::config::MESSAGE_QUEUES;
-use crate::db::{activate_telegram_link_code, find_telegram_link_code, mint_telegram_link_code};
+use crate::db::{activate_telegram_link_code, mint_telegram_link_code};
 use mostro_core::error::CantDoReason;
 use mostro_core::error::MostroError;
 use mostro_core::error::MostroError::*;
@@ -102,6 +102,7 @@ pub async fn handle_start(
 mod tests {
     use super::*;
     use crate::app::context::test_utils::{test_settings, TestContextBuilder};
+    use crate::db::find_telegram_link_code;
     use nostr_sdk::prelude::{Keys, Timestamp};
 
     fn create_test_keys() -> Keys {

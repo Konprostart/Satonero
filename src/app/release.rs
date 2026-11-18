@@ -399,9 +399,16 @@ pub async fn release_action(
     .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 
     if result.rows_affected() == 0 {
-        tracing::warn!(
-            "Order {} not transitioned to settled-hold-invoice: status changed concurrently",
-            order.id
+        // The escrow hold invoice was already settled above, so a CAS miss
+        // here means the order moved on concurrently (admin settle/cancel via
+        // RPC, or a scheduler transition) while the settle was in flight. The
+        // funds are released but this path will not advance the order or pay
+        // the buyer — surface it loudly for reconciliation instead of a quiet
+        // `warn`.
+        tracing::error!(
+            order_id = %order.id,
+            "release: escrow settled but order not advanced to settled-hold-invoice \
+             (status changed concurrently); buyer payout skipped — reconcile manually"
         );
         return Ok(());
     }
@@ -524,8 +531,15 @@ pub async fn release_action(
     // bond release is logged but does not block trade finalization.
     bond::release_taker_bonds_for_order_or_warn(pool, order.id, "release_action").await;
 
-    // Finally we try to pay buyer's invoice
-    let _ = do_payment(ctx, order, request_id).await;
+    // Finally we try to pay buyer's invoice. The failure is recorded durably
+    // for the payout retry job, but must still be surfaced here.
+    let order_id = order.id;
+    if let Err(e) = do_payment(ctx, order, request_id).await {
+        tracing::warn!(
+            order_id = %order_id,
+            "release: buyer payout failed (queued for retry): {}", e
+        );
+    }
 
     Ok(())
 }

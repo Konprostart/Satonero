@@ -4,12 +4,13 @@ use mostro_core::order::Kind as OrderKind;
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
 use sqlx::pool::Pool;
-use sqlx::sqlite::SqliteRow;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
 use sqlx::{AssertSqlSafe, Row, Sqlite, SqlitePool};
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::fs::{set_permissions, Permissions};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -421,6 +422,30 @@ async fn reconcile_existing_add_column_migration(
     Ok(false)
 }
 
+/// Build the SQLite connection options used for the daemon's database.
+///
+/// WAL journal mode is the key production-readiness choice: the daemon is not
+/// a strict single writer — the event loop, every scheduler job, the Telegram
+/// long-poller and the optional admin gRPC server share one pool. In the
+/// default rollback-journal mode a writer takes an exclusive lock that blocks
+/// every reader, so under a concurrent load (many open trades, many linked
+/// Telegram chats) reads and writes serialise and can surface as
+/// `SQLITE_BUSY`. WAL keeps readers and the single writer concurrent.
+///
+/// `busy_timeout` is raised from sqlx's 5 s default so a briefly-held write
+/// lock is waited out instead of failing a user-facing operation. `foreign_keys`
+/// stays at sqlx's default ON; `synchronous` stays at SQLite's default FULL
+/// (a financial daemon must not trade crash-durability for throughput).
+fn sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, MostroError> {
+    SqliteConnectOptions::from_str(db_url)
+        .map(|opts| {
+            opts.journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_secs(30))
+                .create_if_missing(true)
+        })
+        .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))
+}
+
 pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
     // Get mostro settings
     let db_settings = Settings::get_db();
@@ -441,7 +466,10 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         }
 
         // Create new database connection
-        match SqlitePool::connect(db_url).await {
+        match SqlitePoolOptions::new()
+            .connect_with(sqlite_connect_options(db_url)?)
+            .await
+        {
             Ok(pool) => {
                 match sqlx::migrate!().run(&pool).await {
                     Ok(_) => {
@@ -492,7 +520,8 @@ pub async fn connect() -> Result<Arc<Pool<Sqlite>>, MostroError> {
         }
     } else {
         // Connect to existing database
-        let conn = SqlitePool::connect(db_url)
+        let conn = SqlitePoolOptions::new()
+            .connect_with(sqlite_connect_options(db_url)?)
             .await
             .map_err(|e| MostroInternalErr(ServiceError::DbAccessError(e.to_string())))?;
 

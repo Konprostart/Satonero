@@ -83,6 +83,14 @@ pub(crate) const PAYOUT_INFLIGHT_SCAN_LIMIT: u64 = 2_000;
 /// deadline of its own.
 pub(crate) const PAYOUT_INFLIGHT_COUNT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound for the LND gRPC calls the event loop and scheduler jobs await
+/// inline. `fedimint-tonic-lnd` sets no per-RPC deadline of its own, so
+/// without this a half-dead LND node (connection accepted, never answers)
+/// would hang the daemon's single consumer forever. These settle/cancel/
+/// lookup operations are normally sub-second; 30 s is generous headroom, not
+/// a tuning knob.
+pub(crate) const LND_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// In-flight payments at LND, split into the two quantities the payout gate
 /// cares about: how many there are overall, and how many are headed for the
 /// same destination as the payout about to be sent.
@@ -546,16 +554,19 @@ impl LndConnector {
         let preimage = decode_hash32("preimage", preimage)?;
 
         let preimage_message = SettleInvoiceMsg { preimage };
-        let settle = self
-            .client
-            .invoices()
-            .settle_invoice(preimage_message)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnNodeError(e.to_string())));
+        let settle = timeout(
+            LND_RPC_TIMEOUT,
+            self.client.invoices().settle_invoice(preimage_message),
+        )
+        .await;
 
         match settle {
-            Ok(settle) => Ok(settle.into_inner()),
-            Err(e) => Err(e),
+            Ok(Ok(settle)) => Ok(settle.into_inner()),
+            Ok(Err(e)) => Err(MostroInternalErr(ServiceError::LnNodeError(e.to_string()))),
+            Err(_) => Err(MostroInternalErr(ServiceError::LnNodeError(format!(
+                "LND settle_invoice timed out after {}s",
+                LND_RPC_TIMEOUT.as_secs()
+            )))),
         }
     }
 
@@ -566,11 +577,15 @@ impl LndConnector {
         let payment_hash = decode_hash32("payment hash", hash)?;
 
         let cancel_message = CancelInvoiceMsg { payment_hash };
-        let cancel = self.client.invoices().cancel_invoice(cancel_message).await;
+        let cancel = timeout(
+            LND_RPC_TIMEOUT,
+            self.client.invoices().cancel_invoice(cancel_message),
+        )
+        .await;
 
         match cancel {
-            Ok(cancel) => Ok(cancel.into_inner()),
-            Err(status) => {
+            Ok(Ok(cancel)) => Ok(cancel.into_inner()),
+            Ok(Err(status)) => {
                 // Preserve the gRPC code in the error string with a stable
                 // `code=<Code>` prefix. Bond release uses this to tell
                 // benign "already canceled / not found" outcomes from
@@ -582,6 +597,10 @@ impl LndConnector {
                     status.message()
                 ))))
             }
+            Err(_) => Err(MostroInternalErr(ServiceError::LnNodeError(format!(
+                "LND cancel_invoice timed out after {}s",
+                LND_RPC_TIMEOUT.as_secs()
+            )))),
         }
     }
 
@@ -599,16 +618,22 @@ impl LndConnector {
     ) -> Result<Option<u32>, MostroError> {
         let r_hash = decode_hash32("payment hash", hash)?;
 
-        let invoice = self
-            .client
-            .lightning()
-            .lookup_invoice(PaymentHash {
+        let invoice = timeout(
+            LND_RPC_TIMEOUT,
+            self.client.lightning().lookup_invoice(PaymentHash {
                 r_hash,
                 ..Default::default()
-            })
-            .await
-            .map_err(lookup_invoice_error)?
-            .into_inner();
+            }),
+        )
+        .await
+        .map_err(|_| {
+            MostroInternalErr(ServiceError::LnNodeError(format!(
+                "LND lookup_invoice timed out after {}s",
+                LND_RPC_TIMEOUT.as_secs()
+            )))
+        })?
+        .map_err(lookup_invoice_error)?
+        .into_inner();
 
         Ok(invoice
             .htlcs
@@ -928,9 +953,14 @@ impl LndConnector {
             no_inflight_updates: false,
         };
 
-        let stream = match self.client.router().track_payment_v2(track_req).await {
-            Ok(s) => s,
-            Err(status) => {
+        let stream = match timeout(
+            LND_RPC_TIMEOUT,
+            self.client.router().track_payment_v2(track_req),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(status)) => {
                 if status.code() == fedimint_tonic_lnd::tonic::Code::NotFound {
                     return Ok(None);
                 }
@@ -940,11 +970,17 @@ impl LndConnector {
                     status.message()
                 ))));
             }
+            Err(_) => {
+                return Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+                    "LND track_payment_v2 timed out after {}s",
+                    LND_RPC_TIMEOUT.as_secs()
+                ))));
+            }
         };
 
         let mut stream = stream.into_inner();
-        match stream.message().await {
-            Ok(Some(payment)) => {
+        match timeout(LND_RPC_TIMEOUT, stream.message()).await {
+            Ok(Ok(Some(payment))) => {
                 let status =
                     fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(payment.status)
                         .map_err(|_| {
@@ -958,8 +994,8 @@ impl LndConnector {
                     failure_reason: payment.failure_reason,
                 }))
             }
-            Ok(None) => Ok(None),
-            Err(status) => {
+            Ok(Ok(None)) => Ok(None),
+            Ok(Err(status)) => {
                 if status.code() == fedimint_tonic_lnd::tonic::Code::NotFound {
                     Ok(None)
                 } else {
@@ -970,6 +1006,10 @@ impl LndConnector {
                     ))))
                 }
             }
+            Err(_) => Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+                "LND track_payment_v2 stream timed out after {}s",
+                LND_RPC_TIMEOUT.as_secs()
+            )))),
         }
     }
 
@@ -986,17 +1026,23 @@ impl LndConnector {
             no_inflight_updates: false,
         };
 
-        let mut stream = self
-            .client
-            .router()
-            .track_payment_v2(track_req)
-            .await
-            .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?
-            .into_inner();
+        let mut stream = timeout(
+            LND_RPC_TIMEOUT,
+            self.client.router().track_payment_v2(track_req),
+        )
+        .await
+        .map_err(|_| {
+            MostroInternalErr(ServiceError::LnPaymentError(format!(
+                "LND track_payment_v2 timed out after {}s",
+                LND_RPC_TIMEOUT.as_secs()
+            )))
+        })?
+        .map_err(|e| MostroInternalErr(ServiceError::LnPaymentError(e.to_string())))?
+        .into_inner();
 
         // Get the first (current) status update
-        match stream.message().await {
-            Ok(Some(payment)) => fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(
+        match timeout(LND_RPC_TIMEOUT, stream.message()).await {
+            Ok(Ok(Some(payment))) => fedimint_tonic_lnd::lnrpc::payment::PaymentStatus::try_from(
                 payment.status,
             )
             .map_err(|_| {
@@ -1004,12 +1050,16 @@ impl LndConnector {
                     "Unknown payment status".to_string(),
                 ))
             }),
-            Ok(None) => Err(MostroInternalErr(ServiceError::LnPaymentError(
+            Ok(Ok(None)) => Err(MostroInternalErr(ServiceError::LnPaymentError(
                 "No payment status received (stream ended)".to_string(),
             ))),
-            Err(e) => Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+            Ok(Err(e)) => Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
                 "Failed to get payment status: {}",
                 e
+            )))),
+            Err(_) => Err(MostroInternalErr(ServiceError::LnPaymentError(format!(
+                "LND track_payment_v2 stream timed out after {}s",
+                LND_RPC_TIMEOUT.as_secs()
             )))),
         }
     }
